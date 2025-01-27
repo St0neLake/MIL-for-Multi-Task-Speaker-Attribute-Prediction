@@ -1,0 +1,30 @@
+method: bayes
+metric:
+  goal: minimize
+  name: eval/avg_mil_loss
+parameters:
+  hdim:
+    distribution: constant
+    value: 8
+  epochs:
+    distribution: int_uniform
+    max: 1000
+    min: 500
+  actor_learning_rate:
+    distribution: log_uniform_values
+    max: 1.0e-02
+    min: 1.0e-04
+  critic_learning_rate:
+    distribution: log_uniform_values
+    value: 0
+  learning_rate:
+    distribution: log_uniform_values
+    max: 1.0e-04
+    min: 1.0e-05
+  early_stopping_patience:
+    distribution: constant
+    value: 100
+  batch_size:
+    distribution: constant
+    value: 128
+run_cap: 50
