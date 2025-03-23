@@ -31,4 +31,4 @@ python3 preprocess.py \
   --congress_terms_raw_data_address ${congress_terms_raw_data_address} \
   --hein_daily_preprocessed_data_dir ${preprocessed_data_dir} \
   --final_data_address ${final_data_address} \
-  --years ${years} 
+  --years ${years}
