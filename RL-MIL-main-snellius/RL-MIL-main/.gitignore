@@ -369,7 +369,6 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/python,intellij+all,jupyternotebooks,linux,macos,windows,visualstudiocode
 
 # local files
-data/
 wandb/
 TwitterDeveloperAccounts.csv
 twitter_handles/
