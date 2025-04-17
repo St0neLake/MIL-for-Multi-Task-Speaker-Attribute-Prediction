@@ -3,11 +3,11 @@
 cd ..
 source venv/bin/activate
 
-dataset="jigsaw" # or "political_data_with_age" or "facebook"
-whole_bag_size=50 # or 100
+dataset="political_data_with_age" # or "political_data_with_age" or "facebook"
+whole_bag_size=100 # or 100
 num_pos_samples=5 # only used in jigsaw datasets, 5 for making `jigsaw_5` and 10 for making `jigsaw_10`
 
-data_embedded_column_name="comment_text" # or "text"
+data_embedded_column_name="text" # or "text"
 
 random_seeds=(42 43 44 45 46)
 gpus=(0 1 2 3 4)
