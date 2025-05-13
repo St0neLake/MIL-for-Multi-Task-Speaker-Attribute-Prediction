@@ -102,12 +102,12 @@ class MultiTaskBaseMIL(nn.Module, ABC):
 
 class BaseMLP(nn.Module, ABC):
     def __init__(
-            self,
-            input_dim: int,
-            hidden_dim: int,
-            output_dim: int,
-            dropout_p: float = 0.5,
-            autoencoder_layer_sizes=None,
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout_p: float = 0.5,
+        autoencoder_layer_sizes=None,
     ):
         super(BaseMLP, self).__init__()
         self.input_dim = input_dim
@@ -155,92 +155,93 @@ class BaseMLP(nn.Module, ABC):
         pass
 
 
-class MeanMLP(BaseMLP):
+class MultiTaskMeanMLP(MultiTaskBaseMIL):
     def __init__(
-            self,
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p: float = 0.5,
-            autoencoder_layer_sizes=None,
+        self,
+        input_dim_instance: int,
+        task_configs: List[Dict[str, Any]],
+        autoencoder_layer_sizes: Optional[List[int]] = None,
+        default_head_hidden_dim: int = 128,
+        default_head_dropout_p: float = 0.1
     ):
-        super(MeanMLP, self).__init__(
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p,
-            autoencoder_layer_sizes=autoencoder_layer_sizes,
+        super().__init__(
+            input_dim_instance,
+            task_configs,
+            autoencoder_layer_sizes,
+            default_head_hidden_dim,
+            default_head_dropout_p
         )
 
     def aggregate(self, x):
-        return torch.mean(x, dim=1)  # Compute the mean along the bag_size dimension
+        return torch.mean(x, dim=1)
 
 
-class MaxMLP(BaseMLP):
+class MultiTaskMaxMLP(MultiTaskBaseMIL):
     def __init__(
             self,
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p: float = 0.5,
-            autoencoder_layer_sizes=None,
-    ):
-        super(MaxMLP, self).__init__(
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p,
-            autoencoder_layer_sizes=autoencoder_layer_sizes,
+            input_dim_instance: int,
+            task_configs: List[Dict[str, Any]],
+            autoencoder_layer_sizes: Optional[List[int]] = None,
+            default_head_hidden_dim: int = 128,
+            default_head_dropout_p: float = 0.1
+        ):
+        super().__init__(
+            input_dim_instance,
+            task_configs,
+            autoencoder_layer_sizes,
+            default_head_hidden_dim,
+            default_head_dropout_p
         )
 
     def aggregate(self, x):
-        return torch.max(
-            x, dim=1
-        ).values  # Compute the max along the bag_size dimension
+        return torch.max(x, dim=1).values
 
 
-class AttentionMLP(BaseMLP):
+class MultiTaskAttentionMLP(MultiTaskBaseMIL):
     def __init__(
             self,
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p: float = 0.5,
+            input_dim_instance: int,
+            task_configs: List[Dict[str, Any]],
+            autoencoder_layer_sizes: Optional[List[int]] = None,
             is_linear_attention: bool = True,
             attention_size: int = 64,
-            attention_dropout_p: float = 0.5,
-            autoencoder_layer_sizes=None,
-    ):
-        super(AttentionMLP, self).__init__(
-            input_dim,
-            hidden_dim,
-            output_dim,
-            dropout_p,
-            autoencoder_layer_sizes=autoencoder_layer_sizes,
-        )
-        self.attention = None
-        self.is_linear_attention = is_linear_attention
+            attention_dropout_p: float = 0.1,
+            default_head_hidden_dim: int = 128,
+            default_head_dropout_p: float = 0.1
+        ):
+        self.is_linear_attention = is_linear_attention # Must be set before super init if init_attention uses it
         self.attention_size = attention_size
         self.attention_dropout_p = attention_dropout_p
 
-        self.init_attention()
-        self.initialize_weights()
+        # Determine attention_input_dim before calling super
+        attention_input_dim = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim_instance
 
-    def init_attention(self):
+        super().__init__(
+            input_dim_instance,
+            task_configs,
+            autoencoder_layer_sizes,
+            default_head_hidden_dim,
+            default_head_dropout_p
+        )
+
+        self.init_attention(attention_input_dim)
+        self.initialize_weights() # Re-initialize to catch attention_layer
+
+    def init_attention(self, attention_input_dim: int):
         if self.is_linear_attention:
-            self.attention = nn.Linear(self.input_dim, 1)
+            self.attention_layer = nn.Linear(attention_input_dim, 1)
         else:
-            self.attention = torch.nn.Sequential(
-                torch.nn.Linear(self.input_dim, self.attention_size),
-                torch.nn.Dropout(p=self.attention_dropout_p),
-                torch.nn.Tanh(),
-                torch.nn.Linear(self.attention_size, 1),
+            self.attention_layer = nn.Sequential(
+                nn.Linear(attention_input_dim, self.attention_size),
+                nn.Dropout(p=self.attention_dropout_p),
+                nn.Tanh(),
+                nn.Linear(self.attention_size, 1),
             )
 
     def aggregate(self, x):
-        attention = self.attention(x)
-        attention = F.softmax(attention, dim=1)
-        return torch.sum(x * attention, dim=1)
+        attention_weights = self.attention_layer(x)
+        attention_weights = F.softmax(attention_weights, dim=1)
+        return torch.sum(x * attention_weights, dim=1)
 
 
 class ApproxRepSet(nn.Module):
