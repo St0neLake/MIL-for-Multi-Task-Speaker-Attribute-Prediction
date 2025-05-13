@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+from typing import List, Dict, Any, Optional # Added for type hinting
 
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, f1_score, r2_score, roc_auc_score
 
@@ -41,39 +42,64 @@ class BaseNetwork(nn.Module):
         return x
 
 
-class SimpleMLP(nn.Module, ABC):
+class MultiTaskBaseMIL(nn.Module, ABC):
     def __init__(
-            self,
-            input_dim: int,
-            hidden_dim: int,
-            output_dim: int,
-            dropout_p: float = 0.5,
+        self,
+        input_dim_instance: int,
+        task_configs: List[Dict[str, Any]],
+        autoencoder_layer_sizes: Optional[List[int]] = None,
+        default_head_hidden_dim: int = 128,
+        default_head_dropout_p: float = 0.1
     ):
-        super(SimpleMLP, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.dropout_p = dropout_p  # register the droupout probability as a buffer
+        super(MultiTaskBaseMIL, self).__init__()
+        self.input_dim_instance = input_dim_instance
+        self.task_configs = task_configs # Store for reference by PolicyNetwork
+        self.autoencoder_layer_sizes = autoencoder_layer_sizes
+        self.base_network = BaseNetwork(self.autoencoder_layer_sizes)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(self.input_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=self.dropout_p),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
+        aggregated_feature_dim = self.autoencoder_layer_sizes[-1] if self.autoencoder_layer_sizes else self.input_dim_instance
 
+        self.task_heads = nn.ModuleDict()
+        for task_config in self.task_configs:
+            task_name = task_config['name']
+            output_dim_task = task_config['output_dim']
+            head_hidden_dim = task_config.get('head_hidden_dim', default_head_hidden_dim)
+            head_dropout_p = task_config.get('head_dropout_p', default_head_dropout_p)
+
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(aggregated_feature_dim, head_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=head_dropout_p),
+                nn.Linear(head_hidden_dim, output_dim_task)
+            )
         self.initialize_weights()
 
     def initialize_weights(self):
-        for m in self.modules():
+        # Initialize weights for base_network and all task_heads
+        for m in self.modules(): # self.modules() includes base_network and task_heads
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mlp(x)  # Apply the MLP
-        return x
-    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        instance_embeddings = self.base_network(x)
+        aggregated_representation = self.aggregate(instance_embeddings)
+
+        outputs = {}
+        for task_name, head in self.task_heads.items():
+            outputs[task_name] = head(aggregated_representation)
+        return outputs
+
+    def get_aggregated_data(self, x: torch.Tensor) -> torch.Tensor:
+        instance_embeddings = self.base_network(x)
+        aggregated_representation = self.aggregate(instance_embeddings)
+        return aggregated_representation
+
+    @abstractmethod
+    def aggregate(self, x: torch.Tensor) -> torch.Tensor:
+        pass
+
 class BaseMLP(nn.Module, ABC):
     def __init__(
             self,
@@ -117,7 +143,7 @@ class BaseMLP(nn.Module, ABC):
         x = self.base_network(x)
         x = self.aggregate(x)
         return x
-    
+
     @abstractmethod
     def aggregate(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -481,7 +507,7 @@ def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
-            
+
 class ActorNetwork(nn.Module):
     def __init__(self, **kwargs):
         super(ActorNetwork, self).__init__()
@@ -498,7 +524,7 @@ class ActorNetwork(nn.Module):
         )
         self.actor.apply(init_weights)
         # nn.init.xavier_uniform_(self.actor.weight)
-        
+
     def forward(self, x):
         # action_probs = F.softmax(self.actor(x), dim=-1)
         action_probs = F.sigmoid(self.actor(x))
@@ -548,13 +574,13 @@ def sample_action(action_probs, n, device, random=False, algorithm="with_replace
         NotImplementedError
 
 def sample_action_with_replacement(action_probs, n, device, random=False):
-    # with replacement  
-    m = Categorical(action_probs)  
+    # with replacement
+    m = Categorical(action_probs)
     if random:
         action = torch.randint(0, action_probs.shape[1], (n, action_probs.shape[0])).to(device)
     else:
         action = m.sample((n,))
-    
+
     log_prob = m.log_prob(action).sum(dim=0)
     # from IPython import embed; embed(); exit()
     return action.T, log_prob
@@ -566,7 +592,7 @@ def sample_action_without_replacement(action_probs, n, device, random=False):
     if random:
         action = torch.empty((action_probs.shape[0], n), dtype=torch.long)
         for i in range(action_probs.shape[0]):
-            action[i] = torch.randperm(action_probs.shape[1])[:n]  
+            action[i] = torch.randperm(action_probs.shape[1])[:n]
         action = action.to(device)
     else:
         action = torch.multinomial(sample_weights, n)
@@ -580,7 +606,7 @@ def sample_static_action(action_probs, n, device, random=False):
     if random:
         action = torch.empty((action_probs.shape[0], n), dtype=torch.long)
         for i in range(action_probs.shape[0]):
-            action[i] = torch.randperm(action_probs.shape[1])[:n]  
+            action[i] = torch.randperm(action_probs.shape[1])[:n]
         action = action.to(device)
         log_prob = torch.gather(action_probs, 1, action)
     else:
@@ -609,7 +635,7 @@ class PolicyNetwork(nn.Module):
         self.max_clip = kwargs['max_clip']
         self.sample_algorithm = kwargs.get('sample_algorithm', 'with_replacement')
         self.no_autoencoder = kwargs.get('no_autoencoder', False)
-        
+
         try:
             self.task_optim = optim.AdamW(self.task_model.parameters(), lr=self.learning_rate)
         except:
@@ -624,7 +650,7 @@ class PolicyNetwork(nn.Module):
             batch_rep = batch_x
         else:
             batch_rep = self.task_model.base_network(batch_x).detach()
-        
+
         # batch_size, bag_size, embedding_size = batch_rep.shape
         # batch_rep = batch_rep.view(batch_size * bag_size, embedding_size)
 
@@ -677,7 +703,7 @@ class PolicyNetwork(nn.Module):
                 elif self.task_type == 'classification':
                     prob_y = torch.softmax(pred_out, dim=1)
                     pred_y = torch.argmax(pred_out, dim=1)
-                    
+
                 pred_ys.append(pred_y.detach().cpu())
                 prob_ys.append(prob_y.detach().cpu())
                 data_ys.append(batch_y.detach().cpu())
@@ -687,7 +713,7 @@ class PolicyNetwork(nn.Module):
             prob_Y = torch.cat(prob_ys, dim=0)
             if self.task_type == 'classification':
                 reward = f1_score(data_Y.data, pred_Y.data, average='macro')
-            elif self.task_type == 'regression':   
+            elif self.task_type == 'regression':
                 reward = r2_score(data_Y.data, pred_Y.data)
         return reward, np.mean(losses), prob_Y, data_Y
 
@@ -703,7 +729,7 @@ class PolicyNetwork(nn.Module):
                 elif self.task_type == 'classification':
                     prob_y = torch.softmax(pred_out, dim=1)
                     pred_y = torch.argmax(pred_out, dim=1)
-                    
+
                 pred_ys.append(pred_y.detach().cpu())
                 prob_ys.append(prob_y.detach().cpu())
                 data_ys.append(batch_y.detach().cpu())
@@ -724,13 +750,13 @@ class PolicyNetwork(nn.Module):
                     'f1_micro': f1_micro,
                     'auc': auc,
                 })
-            elif self.task_type == 'regression':   
+            elif self.task_type == 'regression':
                 reward = r2_score(data_Y.data, pred_Y.data)
                 metrics.update({
                     'r2': reward,
                 })
         return metrics, prob_Y.tolist(), data_Y.tolist(), pred_Y.tolist()
-    
+
     def train_minibatch(self, batch_x, batch_y):
         self.task_model.train()
         batch_out = self.task_model(batch_x)
@@ -770,7 +796,7 @@ class PolicyNetwork(nn.Module):
         mean_reward = np.mean(reward_pool)
         mean_loss = np.mean(loss_pool)
         return mean_reward, mean_loss, ensemble_reward
-    
+
     def predict_pool(self, pool_data):
         probs_pool = []
         for data in pool_data:
@@ -789,7 +815,7 @@ class PolicyNetwork(nn.Module):
                 prob_ys.append(prob_y.detach().cpu())
             prob_Y = torch.cat(prob_ys, dim=0)
         return prob_Y
-    
+
     def ensemble_predict(self, pool_data):
         preds_pool = []
         for data in pool_data:
