@@ -244,48 +244,69 @@ class MultiTaskAttentionMLP(MultiTaskBaseMIL):
         return torch.sum(x * attention_weights, dim=1)
 
 
-class ApproxRepSet(nn.Module):
+class MultiTaskApproxRepSet(nn.Module):
     def __init__(
-            self,
-            input_dim,
-            n_hidden_sets,
-            n_elements,
-            n_classes,
-            autoencoder_layer_sizes=None,
-    ):
-        super(ApproxRepSet, self).__init__()
+            self, 
+            input_dim_instance: int, 
+            task_configs: List[Dict[str, Any]], 
+            n_hidden_sets: int, 
+            n_elements: int, 
+            autoencoder_layer_sizes: Optional[List[int]] = None, 
+            fc1_hidden_dim: int = 32, 
+            default_head_hidden_dim: int = 128, 
+            default_head_dropout_p: float = 0.1
+        ):
+        
+        super().__init__()
         self.n_hidden_sets = n_hidden_sets
         self.n_elements = n_elements
-
+        self.task_configs = task_configs # Store for reference
+        self.fc1_hidden_dim = fc1_hidden_dim
         self.autoencoder_layer_sizes = autoencoder_layer_sizes
         self.base_network = BaseNetwork(self.autoencoder_layer_sizes)
 
-        self.Wc = nn.Parameter(torch.FloatTensor(input_dim, n_hidden_sets * n_elements))
-
-        self.fc1 = nn.Linear(n_hidden_sets, 32)
-        self.fc2 = nn.Linear(32, n_classes)
+        repset_input_dim = self.autoencoder_layer_sizes[-1] if self.autoencoder_layer_sizes else input_dim_instance
+        self.Wc = nn.Parameter(torch.FloatTensor(repset_input_dim, n_hidden_sets * n_elements))
+        self.fc1 = nn.Linear(n_hidden_sets, self.fc1_hidden_dim)
         self.relu = nn.ReLU()
 
+        self.task_heads = nn.ModuleDict()
+        for task_config in self.task_configs:
+            task_name = task_config['name']
+            output_dim_task = task_config['output_dim']
+            head_hidden_dim = task_config.get('head_hidden_dim', default_head_hidden_dim)
+            head_dropout_p = task_config.get('head_dropout_p', default_head_dropout_p)
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(self.fc1_hidden_dim, head_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=head_dropout_p),
+                nn.Linear(head_hidden_dim, output_dim_task)
+            )
         self.init_weights()
 
     def init_weights(self):
         nn.init.xavier_uniform_(self.Wc.data)
-        nn.init.xavier_uniform_(self.fc1.weight.data)
-        nn.init.xavier_uniform_(self.fc2.weight.data)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def aggregate_and_encode(self, x: torch.Tensor) -> torch.Tensor:
+        t = self.base_network(x)
+        t = self.relu(torch.matmul(t, self.Wc))
+        t = t.view(t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets)
+        t, _ = torch.max(t, dim=2)
+        t = torch.sum(t, dim=1)
+        t = self.relu(self.fc1(t))
+        return t
 
-    def forward(self, x):  # x: (batch_size, bag_size, d)
-        t = self.base_network(x)  # t: (batch_size, bag_size, d)
-        t = self.relu(
-            torch.matmul(t, self.Wc)
-        )  # t: (batch_size, bag_size, n_hidden_sets * n_elements)
-        t = t.view(
-            t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets
-        )  # t: (batch_size, bag_size, n_elements, n_hidden_sets)
-        t, _ = torch.max(t, dim=2)  # t: (batch_size, bag_size, n_hidden_sets)
-        t = torch.sum(t, dim=1)  # t: (batch_size, n_hidden_sets)
-        t = self.relu(self.fc1(t))  # t: (batch_size, 32)
-        out = self.fc2(t)  # t: (batch_size, n_classes)
-        return out
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        aggregated_encoded_representation = self.aggregate_and_encode(x)
+        outputs = {}
+        for task_name, head in self.task_heads.items():
+            outputs[task_name] = head(aggregated_encoded_representation)
+        return outputs
 
 
 class StratifiedRandomBaseline:
