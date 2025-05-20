@@ -117,7 +117,7 @@ def get_classification_metrics(model, dataloader, device, average='macro', detai
         y = y.to(torch.int64)
         all_y.extend(y.tolist())
         all_y_hat_prob.extend(y_prob.cpu().detach().tolist())
-        
+
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_y, all_y_hat, average=average, zero_division=0
     )
@@ -264,44 +264,71 @@ def create_bag_masks(df, bag_size, bag_embedded_column_name):
 def preprocess_dataframe(
         df: pd.DataFrame,
         dataframe_set: str,
-        label: str,
-        train_dataframe_mean: Optional[float],
-        train_dataframe_median: Optional[float],
-        train_dataframe_std: Optional[float],
-        task_type: str,
+        target_labels: list[str], # CHANGED: from label: str to target_labels: list[str]
+        train_dataframe_means: dict[str, Optional[float]], # CHANGED: to dict
+        train_dataframe_medians: dict[str, Optional[float]], # CHANGED: to dict
+        train_dataframe_stds: dict[str, Optional[float]], # CHANGED: to dict
+        task_type: str, # This might become a dict if tasks have different types, or assume classification for now
         extra_columns: Optional[List[str]] = [],
 ):
-    # from IPython import embed; embed()
-    df = df[["bag_embeddings", "bag", "bag_mask", label] + extra_columns]
-    df = df.dropna()
-    df = df.reset_index(drop=True)
-    label2id = None
-    id2label = None
-    if task_type == "regression":
-        new_label = label
-    else:
-        if label in REGRESSION_LABELS:
-            new_label = f"{label}_encoded"
-            # 1 std before mean classifies as 0, between 1 std before and 1 std after mean classifies as 1, 1 std after
-            # mean classifies as 2
+    # Ensure essential columns are present
+    required_cols = ["bag_embeddings", "bag", "bag_mask"] + target_labels + extra_columns
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col} in DataFrame")
 
-            # 0 if below mean and 1 if above or equal to mean
-            # df[new_label] = df[label].apply(lambda x: 0 if x < train_dataframe_mean else 1)
+    df_processed = df[required_cols].copy() # Work on a copy
+    df_processed = df_processed.dropna(subset=target_labels) # Drop rows if any of the target labels are NaN
+    df_processed = df_processed.reset_index(drop=True)
 
-            # 0 if below median and 1 if above or equal to median
-            df[new_label] = df[label].apply(lambda x: 0 if x < train_dataframe_median else 1)
-        else:
-            new_label = f"{label}_encoded"
+    all_label2id = {}
+    all_id2label = {}
+
+    # Create a new dictionary to store processed labels
+    processed_labels_dict = {}
+
+    for label_name in target_labels:
+        # For MTL, assuming all specified tasks are classification for now, as per your focus.
+        # If 'age' is binned (categorical), this holds.
+        # If a label is inherently regression and needs to be treated as such,
+        # task_type would need to be a dict: task_type[label_name]
+
+        current_task_type = task_type # Assuming common task_type for now
+        # If you plan mixed types: current_task_type = task_type.get(label_name, "classification")
+
+
+        if current_task_type == "regression":
+            processed_labels_dict[label_name] = df_processed[label_name].astype(float)
+        else: # Classification
+            label_encoder = LabelEncoder()
+            encoded_col_name = f"{label_name}_encoded"
+
             if dataframe_set == "train":
-                df[new_label] = SKLEARN_LABEL_ENCODER.fit_transform(df[label])
+                df_processed[encoded_col_name] = label_encoder.fit_transform(df_processed[label_name].astype(str))
             else:
-                df[new_label] = SKLEARN_LABEL_ENCODER.transform(df[label])
+                temp_encoder = LabelEncoder() # Placeholder
+                # Attempt to transform using a vocabulary derived from the current split if encoder not passed
+                # This is a simplified approach.
+                # Ideally, load encoders fitted on the training set.
+                unique_labels_in_split = df_processed[label_name].astype(str).unique()
+                temp_encoder.fit(unique_labels_in_split) # Fit on current split's unique labels
+                df_processed[encoded_col_name] = temp_encoder.transform(df_processed[label_name].astype(str))
+                label_encoder = temp_encoder
 
-            label2id = {label: idx for idx, label in enumerate(SKLEARN_LABEL_ENCODER.classes_.tolist())}
-            id2label = {idx: label for idx, label in enumerate(SKLEARN_LABEL_ENCODER.classes_.tolist())}
-    df = df[["bag_embeddings", "bag", "bag_mask", new_label] + extra_columns]
-    df = df.rename(columns={new_label: "labels"})
-    return df, label2id, id2label
+
+                all_label2id[label_name] = {label: idx for idx, label in enumerate(label_encoder.classes_)}
+                all_id2label[label_name] = {idx: label for idx, label in enumerate(label_encoder.classes_)}
+                processed_labels_dict[label_name] = df_processed[encoded_col_name]
+
+    # Add the dictionary of processed labels as a new column 'labels_dict'
+    # Or RLMILDataset can be modified to take df_processed and extract columns by names later
+    df_processed["labels"] = [dict(zip(processed_labels_dict,t)) for t in zip(*processed_labels_dict.values())]
+
+    # Keep only essential columns plus the new 'labels' dict column
+    final_columns = ["bag_embeddings", "bag", "bag_mask", "labels"] + extra_columns
+    df_final = df_processed[final_columns].copy()
+
+    return df_final, all_label2id, all_id2label
 
 
 def get_df_mean_median_std(df, label):
@@ -317,29 +344,46 @@ def get_df_mean_median_std(df, label):
 
 
 def create_preprocessed_dataframes(train_dataframe: pd.DataFrame, val_dataframe: pd.DataFrame,
-                                   test_dataframe: pd.DataFrame, label: str, task_type: str, extra_columns: Optional[List[str]] = []):
-    train_dataframe_mean, train_dataframe_median, train_dataframe_std = get_df_mean_median_std(
-        train_dataframe, label
+                                   test_dataframe: pd.DataFrame, target_labels: list[str], task_type: str,
+                                   extra_columns: Optional[List[str]] = []):
+    train_dataframe_means = {}
+    train_dataframe_medians = {}
+    train_dataframe_stds = {}
+
+    for label_name in target_labels:
+        mean, median, std = get_df_mean_median_std(train_dataframe, label_name)
+        train_dataframe_means[label_name] = mean
+        train_dataframe_medians[label_name] = median
+        train_dataframe_stds[label_name] = std
+
+    train_dataframe_processed, label2id_map, id2label_map = preprocess_dataframe(
+        df=train_dataframe, dataframe_set="train", target_labels=target_labels,
+        train_dataframe_means=train_dataframe_means,
+        train_dataframe_medians=train_dataframe_medians,
+        train_dataframe_stds=train_dataframe_stds,
+        task_type=task_type, # Adjust if task_type becomes a dict
+        extra_columns=extra_columns
     )
 
-    train_dataframe, label2id, id2label = preprocess_dataframe(df=train_dataframe, dataframe_set="train", label=label,
-                                                               train_dataframe_mean=train_dataframe_mean,
-                                                               train_dataframe_median=train_dataframe_median,
-                                                               train_dataframe_std=train_dataframe_std,
-                                                               task_type=task_type,
-                                                               extra_columns=extra_columns)
-    val_dataframe, _, _ = preprocess_dataframe(df=val_dataframe, dataframe_set="val", label=label,
-                                               train_dataframe_mean=train_dataframe_mean,
-                                               train_dataframe_median=train_dataframe_median,
-                                               train_dataframe_std=train_dataframe_std, task_type=task_type,
-                                               extra_columns=extra_columns)
-    test_dataframe, _, _ = preprocess_dataframe(df=test_dataframe, dataframe_set="test", label=label,
-                                                train_dataframe_mean=train_dataframe_mean,
-                                                train_dataframe_median=train_dataframe_median,
-                                                train_dataframe_std=train_dataframe_std, task_type=task_type,
-                                                extra_columns=extra_columns)
+    val_dataframe_processed, _, _ = preprocess_dataframe(
+        df=val_dataframe, dataframe_set="val", target_labels=target_labels,
+        train_dataframe_means=train_dataframe_means,
+        train_dataframe_medians=train_dataframe_medians,
+        train_dataframe_stds=train_dataframe_stds,
+        task_type=task_type, # Adjust if task_type becomes a dict
+        extra_columns=extra_columns
+    )
 
-    return train_dataframe, val_dataframe, test_dataframe, label2id, id2label
+    test_dataframe_processed, _, _ = preprocess_dataframe(
+        df=test_dataframe, dataframe_set="test", target_labels=target_labels,
+        train_dataframe_means=train_dataframe_means,
+        train_dataframe_medians=train_dataframe_medians,
+        train_dataframe_stds=train_dataframe_stds,
+        task_type=task_type, # Adjust if task_type becomes a dict
+        extra_columns=extra_columns
+    )
+
+    return train_dataframe_processed, val_dataframe_processed, test_dataframe_processed, label2id_map, id2label_map
 
 
 class EarlyStopping:
@@ -434,9 +478,9 @@ def get_model(model_path: str, ensemble: bool = False):
     return model, args
 
 def get_balanced_weights(labels):
-    label_set = list(set(labels)) 
+    label_set = list(set(labels))
     label_set.sort()
     perfect_balance_weights = [len(labels)/labels.count(element) for element in label_set]
-    
+
     sample_weights = [perfect_balance_weights[t] for t in labels]
     return sample_weights

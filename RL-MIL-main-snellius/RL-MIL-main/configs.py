@@ -18,6 +18,7 @@ def parse_args():
         "--label",
         type=str,
         required=True,
+        nargs='+',  # This allows the Python script to receive multiple labels
         choices=[
             "care",
             "purity",
@@ -294,21 +295,21 @@ def parse_args():
     if args.sample_algorithm == 'static':
         args.test_pool_size = 1
         args.eval_pool_size = 1
-    
+
     if args.rl:
         if 'warmup' in args.prefix and args.only_ensemble:
             raise ValueError("Not efficient to run warmup and only_ensemble together")
         if 'warmup' in args.prefix and args.rl_model == "policy_only":
             raise ValueError("Does not make sense to run warmup with policy only since the F1 is not going to change!")
         if args.only_ensemble and args.sample_algorithm != "static":
-            raise ValueError("Only ensemble only works with static sampling!")                
+            raise ValueError("Only ensemble only works with static sampling!")
         # if args.search_algorithm == "epsilon_greedy" and args.rl_task_model == "ensemble":
         #     raise ValueError("Does not make sense to run epsilon_greedy on top of ensemble!")
         if args.search_algorithm == "epsilon_greedy":
             args.prefix = f"{args.prefix}_{args.search_algorithm}"
         if args.reg_alg is not None:
             args.prefix = f"{args.prefix}_reg_{args.reg_alg}"
-        
+
     if args.run_sweep:
         args.no_wandb = False
         if args.rl:
