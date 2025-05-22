@@ -35,7 +35,7 @@ prefix="mtl_test_age_gender_party" # Descriptive prefix for this MTL run
 epochs=50       # Reduced for a quicker test; adjust as needed (original script implies sweeps define this)
 batch_size=32   # From your script's python call
 actor_learning_rate=1e-4 # Placeholder - sweeps would determine optimal
-critic_learning_rate=1e-4# Placeholder - sweeps would determine optimal
+critic_learning_rate=1e-4 # Placeholder - sweeps would determine optimal
 learning_rate=1e-5       # Placeholder - sweeps would determine optimal (for MIL part)
 hdim=8                   # Placeholder - sweeps would determine optimal (for PolicyNetwork actor/critic)
 train_pool_size=1        # From your script
@@ -46,7 +46,7 @@ reg_coef=0.01            # Placeholder for reg_alg="sum"
 
 # This random seed will be used for this specific MTL run (data splitting, initializations)
 # Your original script used random_seed 0 for sweeps, and 42 for a specific run. Let's use 42.
-random_seed_for_run=42
+random_seed_for_run=44
 
 # ---- Constants ----
 task_type="classification" # All three tasks are classification

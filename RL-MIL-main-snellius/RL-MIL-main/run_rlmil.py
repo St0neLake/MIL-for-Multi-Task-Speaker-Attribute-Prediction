@@ -20,7 +20,7 @@ from utils import (
     create_preprocessed_dataframes,
     get_df_mean_median_std,
     get_balanced_weights,
-    EarlyStopping, save_json, load_json, create_mil_model, create_mil_model_with_dict
+    EarlyStopping, save_json, load_json, create_mil_model
 )
 
 logger = None
@@ -208,6 +208,12 @@ def prepare_data(args):
     val_dataframe = read_data_split(data_dir, args.embedding_model, "val")
     test_dataframe = read_data_split(data_dir, args.embedding_model, "test")
 
+    logger.info(f"Current args.label before create_preprocessed_dataframes: {args.label}")
+    # In run_rlmil.py, inside prepare_data()
+    logger.info(f"Train DataFrame columns: {train_dataframe.columns}")
+    logger.info(f"Train DataFrame info for target labels ({args.label}):")
+    train_dataframe[args.label].info(verbose=True, show_counts=True) # DEBUG
+
     train_dataframe_processed, val_dataframe_processed, test_dataframe_processed, label2id_map, id2label_map = create_preprocessed_dataframes(
         train_dataframe, val_dataframe, test_dataframe,
         target_labels=args.label,
@@ -301,7 +307,8 @@ def create_rl_model(args, mil_best_model_dir):
         min_clip=args.min_clip,
         max_clip=args.max_clip,
         sample_algorithm=args.sample_algorithm,
-        no_autoencoder_for_rl=args.no_autoencoder_for_rl
+        no_autoencoder_for_rl=args.no_autoencoder_for_rl,
+        epsilon=args.epsilon
     )
     return policy_network
 
@@ -405,7 +412,7 @@ def train(
 
     # wandb.watch(policy_network.actor, log="all", log_freq=100, log_graph=True)
     if not no_wandb and not only_ensemble:
-        log_dict = get_first_batch_info(policy_network, eval_dataloader, device, bag_size, sample_algorithm)
+        log_dict = get_first_batch_info(policy_network, eval_dataloader, device, bag_size, sample_algorithm, args)
         wandb.log(log_dict)
 
     # logger.info(f"Training model started ....")
@@ -436,13 +443,35 @@ def train(
         eval_avg_combined_reward, eval_avg_combined_loss, eval_ensemble_combined_reward = policy_network.expected_reward_loss(eval_pool)
 
         # For detailed per-task metrics on eval set for logging
-        detailed_eval_metrics, _, _, _ = policy_network.compute_metrics_and_details(eval_pool)
+        detailed_eval_metrics = {} # Initialize
+        if eval_pool and len(eval_pool) > 0:
+            representative_eval_data_list = eval_pool[0] # This is a list of 4-tuples
+            detailed_eval_metrics, _, _, _ = policy_network.compute_metrics_and_details(representative_eval_data_list)
+        else:
+            print("[WARNING train] eval_pool is empty, cannot compute detailed_eval_metrics.")
+            # Populate with default zero/NaN metrics if needed for logging
+            for task_name in args.label:
+                detailed_eval_metrics[f"{task_name}/f1"] = 0.0
+                detailed_eval_metrics[f"{task_name}/accuracy"] = 0.0
+                if args.task_type == 'classification':
+                    detailed_eval_metrics[f"{task_name}/auc"] = 0.0
+            detailed_eval_metrics['loss'] = float('nan')
 
         early_stopping(eval_avg_combined_reward, policy_network) # Early stopping based on combined reward
 
         if not no_wandb:
-            train_eval_pool = policy_network.create_pool_data(train_dataloader, bag_size, eval_pool_size, random=only_ensemble)
-            detailed_train_metrics, _, _, _ = policy_network.compute_metrics_and_details(train_eval_pool)
+            train_eval_pool = policy_network.create_pool_data(train_dataloader, bag_size, eval_pool_size, random=only_ensemble) # Using eval_pool_size for consistency
+            detailed_train_metrics = {}
+            if train_eval_pool and len(train_eval_pool) > 0:
+                representative_train_data_list = train_eval_pool[0]
+                detailed_train_metrics, _, _, _ = policy_network.compute_metrics_and_details(representative_train_data_list)
+            else:
+                print("[WARNING train] train_eval_pool is empty, cannot compute detailed_train_metrics.")
+                for task_name in args.label:
+                    detailed_train_metrics[f"{task_name}/f1"] = 0.0
+                    detailed_train_metrics[f"{task_name}/accuracy"] = 0.0
+                detailed_train_metrics['loss'] = float('nan')
+
             train_avg_combined_reward, _, train_ensemble_combined_reward = policy_network.expected_reward_loss(train_eval_pool)
 
             log_dict.update({
@@ -472,7 +501,7 @@ def train(
 
 
             if not only_ensemble:
-                batch_log_dict_epoch = get_first_batch_info(policy_network, eval_dataloader, device, bag_size, sample_algorithm, args.label)
+                batch_log_dict_epoch = get_first_batch_info(policy_network, eval_dataloader, device, bag_size, sample_algorithm, args)
                 log_dict.update(batch_log_dict_epoch)
 
             if early_stopping.counter == 0: # If this is the best model so far by early stopping
@@ -746,12 +775,18 @@ def main():
     if not args.no_wandb:
         label_str_for_wandb = "_".join(args.label) if isinstance(args.label, list) else args.label
         wandb_run_name = f"RL_MTL_{args.model_name}_{label_str_for_wandb}_{args.bag_size}_{args.prefix}"
+
+        # Shorten the prefix for the tag
+        prefix_for_tag = args.prefix
+        if len(prefix_for_tag) > 50: # 50 is arbitrary, leaves room for "PREFIX_"
+            prefix_for_tag = prefix_for_tag[:25] + "..." + prefix_for_tag[-22:] # Example truncation
+
         run = wandb.init(
             config=vars(args), # Log all args
             tags=[
                 f"DATASET_{args.dataset}", f"BAG_SIZE_{args.bag_size}", f"BASELINE_{args.baseline}",
                 f"LABELS_{label_str_for_wandb}", f"EMBEDDING_{args.embedding_model}",
-                f"SEED_{args.random_seed}", f"PREFIX_{args.prefix}"
+                f"SEED_{args.random_seed}", f"PREFIX_{prefix_for_tag}"
             ],
             entity=args.wandb_entity, project=args.wandb_project, name=wandb_run_name,
         )

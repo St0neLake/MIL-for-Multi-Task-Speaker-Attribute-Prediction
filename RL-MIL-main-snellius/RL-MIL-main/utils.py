@@ -281,6 +281,8 @@ def preprocess_dataframe(
     df_processed = df_processed.dropna(subset=target_labels) # Drop rows if any of the target labels are NaN
     df_processed = df_processed.reset_index(drop=True)
 
+    print(f"Length of df_processed after dropna: {len(df_processed)}") # DEBUG
+
     all_label2id = {}
     all_id2label = {}
 
@@ -288,13 +290,8 @@ def preprocess_dataframe(
     processed_labels_dict = {}
 
     for label_name in target_labels:
-        # For MTL, assuming all specified tasks are classification for now, as per your focus.
-        # If 'age' is binned (categorical), this holds.
-        # If a label is inherently regression and needs to be treated as such,
-        # task_type would need to be a dict: task_type[label_name]
-
         current_task_type = task_type # Assuming common task_type for now
-        # If you plan mixed types: current_task_type = task_type.get(label_name, "classification")
+        # For mixed types: current_task_type = task_type.get(label_name, "classification")
 
 
         if current_task_type == "regression":
@@ -307,18 +304,16 @@ def preprocess_dataframe(
                 df_processed[encoded_col_name] = label_encoder.fit_transform(df_processed[label_name].astype(str))
             else:
                 temp_encoder = LabelEncoder() # Placeholder
-                # Attempt to transform using a vocabulary derived from the current split if encoder not passed
                 # This is a simplified approach.
-                # Ideally, load encoders fitted on the training set.
                 unique_labels_in_split = df_processed[label_name].astype(str).unique()
                 temp_encoder.fit(unique_labels_in_split) # Fit on current split's unique labels
                 df_processed[encoded_col_name] = temp_encoder.transform(df_processed[label_name].astype(str))
                 label_encoder = temp_encoder
 
 
-                all_label2id[label_name] = {label: idx for idx, label in enumerate(label_encoder.classes_)}
-                all_id2label[label_name] = {idx: label for idx, label in enumerate(label_encoder.classes_)}
-                processed_labels_dict[label_name] = df_processed[encoded_col_name]
+            all_label2id[label_name] = {label: idx for idx, label in enumerate(label_encoder.classes_)}
+            all_id2label[label_name] = {idx: label for idx, label in enumerate(label_encoder.classes_)}
+            processed_labels_dict[label_name] = df_processed[encoded_col_name]
 
     # Add the dictionary of processed labels as a new column 'labels_dict'
     # Or RLMILDataset can be modified to take df_processed and extract columns by names later

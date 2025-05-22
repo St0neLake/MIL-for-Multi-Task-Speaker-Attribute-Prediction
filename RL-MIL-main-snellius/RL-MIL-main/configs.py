@@ -160,11 +160,13 @@ def parse_args():
     parser.add_argument(
         "--dropout_p",
         type=float,
+        default=0.5,
         required=False,
     )
     parser.add_argument(
         "--hidden_dim",
         type=int,
+        default=64,
         required=False,
     )
 

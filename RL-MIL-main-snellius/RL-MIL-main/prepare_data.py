@@ -177,9 +177,9 @@ def convert_ladder_to_bins_incas(df: pd.DataFrame):
 def convert_religion_to_bins_incas(df: pd.DataFrame):
     df = df.rename(columns={"religion": "old_religion"})
     df['religion'] = df['old_religion'].apply(lambda x: 'Nonreligious' if x == 'Nonreligious' else 'Religious')
-    return df   
- 
-def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, device, text_column: str, 
+    return df
+
+def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, device, text_column: str,
                    whole_bag_size: int, num_pos_samples: int = 2):
     tqdm.pandas()
     # The random seed for dataset creation
@@ -189,7 +189,7 @@ def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, de
         embedding_model = "Twitter/twhin-bert-base"
     elif embedding_model == 'paraphrase-xlm-r-multilingual-v1':
         embedding_model = "sentence-transformers/paraphrase-xlm-r-multilingual-v1"
-    
+
     tokenizer = AutoTokenizer.from_pretrained(embedding_model, model_max_length=512)
     model = AutoModel.from_pretrained(embedding_model).to(device)
 
@@ -223,7 +223,7 @@ def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, de
 
     elif dataset_name == 'yourmorals_incas':
         bag_heuristic = "longest"
-        
+
         df = pd.read_csv(os.path.join(os.getcwd(), "data", "yourmorals_incas_data.csv"))
         for col in ['timeline_tweets', 'timeline_retweets', 'timeline_replies', 'timeline_quotes', 'timeline_merged_chronologically', 'timeline_cleaned_tweets']:
             df[col] = df[col].apply(eval)
@@ -234,16 +234,16 @@ def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, de
         df = pd.read_csv(os.path.join(os.getcwd(), "data", "incas_data.csv"))
         for col in ['timeline_tweets', 'timeline_retweets', 'timeline_replies', 'timeline_quotes', 'timeline_merged_chronologically', 'timeline_cleaned_tweets']:
             df[col] = df[col].apply(eval)
-        
+
         df = convert_age_to_bins_incas(df)
         df = convert_education_to_bins_incas(df)
         df = convert_ladder_to_bins_incas(df)
         df = convert_political_orientation_to_bins_incas(df)
         df = convert_religion_to_bins_incas(df)
-    
+
     elif dataset_name.startswith('jigsaw'):
         bag_heuristic = ""
-        
+
         df = pd.read_csv('./data/jigsaw/train.csv')
         df['hate'] = (df['severe_toxic'] + df['toxic'] + df['obscene'] + df['identity_hate'] + df['insult'] + df['threat']) > 0
 
@@ -252,10 +252,10 @@ def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, de
         df_non_hate = df[df['hate'] == 0].reset_index(drop=True)
         df_hate = df_hate.sample(frac = 1, random_state=random_seed).reset_index(drop=True)
         df_non_hate = df_non_hate.sample(frac = 1, random_state=random_seed).reset_index(drop=True)
-        
+
         df = synthetic_dataset(df_pos=df_hate, df_neg=df_non_hate,
-                               whole_bag_size=whole_bag_size, 
-                               num_pos_samples=num_pos_samples, 
+                               whole_bag_size=whole_bag_size,
+                               num_pos_samples=num_pos_samples,
                                random_seed=random_seed, text_column=text_column, labels_column='hate')
     elif dataset_name == 'essays':
         bag_heuristic = ""
@@ -287,7 +287,7 @@ def create_dataset(dataset_name: str, embedding_model: str, random_seed: int, de
         df['sentences'] = df['text'].apply(sent_tokenize)
 
         # Shuffle the sentences for each author using a random seed of 42
-        df['sentences'] = df['sentences'].apply(lambda sentences: pd.DataFrame(sentences).sample(frac=1, random_state=random_seed)[0].tolist()) 
+        df['sentences'] = df['sentences'].apply(lambda sentences: pd.DataFrame(sentences).sample(frac=1, random_state=random_seed)[0].tolist())
     else:
         raise ValueError(f"Invalid dataset: {dataset_name}")
 
@@ -317,14 +317,14 @@ def synthetic_dataset(df_pos, df_neg, whole_bag_size, num_pos_samples, random_se
     for i in range(total_samples):
         # pos sample
         pos_samples = df_pos.iloc[num_pos_samples*i:num_pos_samples*(i+1)]
-        neg_samples = df_neg.iloc[num_neg_samples*i:num_neg_samples*(i+1)] 
+        neg_samples = df_neg.iloc[num_neg_samples*i:num_neg_samples*(i+1)]
         bag = pd.concat([pos_samples, neg_samples]).reset_index(drop=True)
         bag = bag.sample(frac = 1).reset_index(drop=True)
         df[text_column].append(bag[text_column].tolist())
         df[f"{labels_column}s"].append(bag[labels_column].tolist())
         df[labels_column].append(int(sum(bag[labels_column].tolist()) > 0))
         # neg sample
-        bag = df_neg.iloc[whole_bag_size*(i+total_samples):whole_bag_size*(i+total_samples+1)] 
+        bag = df_neg.iloc[whole_bag_size*(i+total_samples):whole_bag_size*(i+total_samples+1)]
         bag = bag.sample(frac = 1).reset_index(drop=True)
         df[text_column].append(bag[text_column].tolist())
         df[f"{labels_column}s"].append(bag[labels_column].tolist())
@@ -383,9 +383,9 @@ if __name__ == '__main__':
     os.makedirs(dataset_path, exist_ok=True)
     logger = get_logger(dataset_path)
     logger.info(f"{args=}")
-    
+
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    
+
     set_seed(args.random_seed)
 
     # If dataset os not available in ./data, then create it
@@ -399,7 +399,7 @@ if __name__ == '__main__':
         logger.info(f'{os.path.isfile(val_pickle_path)=}')
         logger.info(f'{os.path.isfile(test_pickle_path)=}')
         logger.info(f'Creating dataset with random seed {args.random_seed}')
-        create_dataset(dataset_name=args.dataset, embedding_model=args.embedding_model, 
+        create_dataset(dataset_name=args.dataset, embedding_model=args.embedding_model,
                        random_seed=args.random_seed, text_column=args.data_embedded_column_name,
                        device=device, whole_bag_size=args.whole_bag_size, num_pos_samples=args.num_pos_samples)
         logger.info(f'Dataset was created with random seed {args.random_seed}')
