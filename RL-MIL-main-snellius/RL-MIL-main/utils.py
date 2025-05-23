@@ -509,6 +509,17 @@ class EarlyStopping:
 
     def __call__(self, current_metric_value, model, epoch: Optional[int] = None):
         improved = False
+
+        if current_metric_value is None:
+            if self.verbose:
+                self.trace_func(f"EarlyStopping: current_metric_value is None at epoch {epoch if epoch is not None else 'N/A'}. No improvement recorded.")
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    self.trace_func(f"EarlyStopping: Stopping training due to patience limit with None metric. Best metric was {self.best_metric_value:.6f} at epoch {self.best_epoch}.")
+            return # Exit if current metric is None to avoid comparison error
+
         if self.descending: # Higher is better
             if current_metric_value > self.best_metric_value + self.delta:
                 improved = True
@@ -529,7 +540,7 @@ class EarlyStopping:
             self.counter = 0
         else:
             self.counter += 1
-            if self.verbose: # Optional: log even when not improving
+            if self.verbose:
                 self.trace_func(
                     f"EarlyStopping counter: {self.counter} out of {self.patience} (Best: {self.best_metric_value:.6f} at epoch {self.best_epoch})"
                 )

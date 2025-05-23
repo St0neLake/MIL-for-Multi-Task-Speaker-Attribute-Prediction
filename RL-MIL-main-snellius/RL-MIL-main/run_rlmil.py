@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
+import argparse
+import traceback
 
 from configs import parse_args
 from RLMIL_Datasets import RLMILDataset
@@ -255,60 +257,89 @@ def prepare_data(args):
 
     return train_dataset, val_dataset, test_dataset
 
-def create_rl_model(args, mil_best_model_dir):
-    task_model_config_path = os.path.join(mil_best_model_dir, "..", "best_model_config.json")
+def create_rl_model(trial_args, mil_best_model_dir_for_task_model_checkpoint): # Renamed args to trial_args for clarity
+    task_model_config_path = os.path.join(mil_best_model_dir_for_task_model_checkpoint, "..", "best_model_config.json")
+    task_model_state_dict_path = os.path.join(mil_best_model_dir_for_task_model_checkpoint, "..", "best_model.pt")
 
+    config_for_task_model_structure = {}
     if os.path.exists(task_model_config_path):
-        mil_config_dict = load_json(task_model_config_path)
+        config_for_task_model_structure = load_json(task_model_config_path)
+        logger.info(f"Loaded task_model structure config from: {task_model_config_path}")
     else:
-        logger.warning(f"MIL config {task_model_config_path} not found. Using args for MIL model creation.")
-        mil_config_dict = vars(args).copy() # Use current run's args
+        logger.warning(
+            f"Task_model config {task_model_config_path} not found. "
+            f"Attempting to define task_model structure using current trial_args. "
+            f"This WILL LIKELY CAUSE A MISMATCH if loading a checkpoint."
+        )
+        # Fallback to current trial_args - use with caution if checkpoint exists
+        config_for_task_model_structure['baseline'] = trial_args.baseline
+        config_for_task_model_structure['input_dim'] = trial_args.input_dim # Raw instance feature dim for autoencoder
+        config_for_task_model_structure['autoencoder_layer_sizes'] = trial_args.autoencoder_layer_sizes
+        config_for_task_model_structure['hidden_dim'] = trial_args.hidden_dim # Default from parse_args (e.g. 64) or sweep
+        config_for_task_model_structure['dropout_p'] = trial_args.dropout_p
+        if trial_args.baseline == 'repset':
+            config_for_task_model_structure['n_hidden_sets'] = trial_args.n_hidden_sets
+            config_for_task_model_structure['n_elements'] = trial_args.n_elements
 
-    # Ensure output_dims_dict is present and correct for MTL
-    mil_config_dict["output_dims_dict"] = args.output_dims_dict
-    mil_config_dict["number_of_classes"] = None # Deprecate, use output_dims_dict
+    # Parameters that MUST come from the current trial_args (data-dependent or RL sweep)
+    config_for_task_model_structure["output_dims_dict"] = trial_args.output_dims_dict
+    config_for_task_model_structure["number_of_classes"] = None # Deprecate
 
-    for key in ["baseline", "input_dim", "hidden_dim", "dropout_p", "autoencoder_layer_sizes", "n_hidden_sets", "n_elements"]:
-        if key not in mil_config_dict and hasattr(args, key):
-            mil_config_dict[key] = getattr(args, key)
-        elif key in mil_config_dict and hasattr(args, key) and getattr(args,key) is not None: # Allow overriding loaded config with args
-             mil_config_dict[key] = getattr(args, key)
+    # Ensure essential keys from trial_args (like baseline, input_dim if not in loaded config) are present
+    # This is more of a safeguard if the loaded config is unexpectedly minimal.
+    config_for_task_model_structure.setdefault('baseline', trial_args.baseline)
+    config_for_task_model_structure.setdefault('input_dim', trial_args.input_dim)
+    config_for_task_model_structure.setdefault('autoencoder_layer_sizes', trial_args.autoencoder_layer_sizes)
+    config_for_task_model_structure.setdefault('dropout_p', trial_args.dropout_p)
+
+    # CRITICAL FIX: Prioritize 'hidden_dim' from loaded config for task heads.
+    # Only override if specifically swept for task heads (e.g., trial_args.sweep_task_head_hidden_dim).
+    # trial_args.hidden_dim from parse_args() is default 64 and should not override a loaded 512.
+    # The sweep YAML 'hp_rl_mtl_loss.yaml' has 'hdim' for PolicyNet actor/critic, not 'hidden_dim' for task heads.
+    if hasattr(trial_args, 'sweep_mil_head_hidden_dim') and trial_args.sweep_mil_head_hidden_dim is not None:
+        # If your sweep YAML for RL was updated to sweep this explicitly, e.g. 'sweep_mil_head_hidden_dim'
+        logger.info(f"Using sweep-defined hidden_dim for task_model heads: {trial_args.sweep_mil_head_hidden_dim}")
+        config_for_task_model_structure['hidden_dim'] = trial_args.sweep_mil_head_hidden_dim
+    elif 'hidden_dim' in config_for_task_model_structure:
+        logger.info(f"Using loaded 'hidden_dim' for task_model heads: {config_for_task_model_structure['hidden_dim']}")
+        # This value (e.g., 512) from the JSON will be used.
+    else:
+        # Fallback if 'hidden_dim' is neither in loaded config nor explicitly swept for task heads.
+        # Uses trial_args.hidden_dim which is likely the default from parse_args (e.g., 64).
+        config_for_task_model_structure.setdefault('hidden_dim', trial_args.hidden_dim)
+        logger.warning(f"Using default/args 'hidden_dim' for task_model heads: {config_for_task_model_structure['hidden_dim']}")
 
 
-    task_model = create_mil_model_with_dict(mil_config_dict)
+    logger.info(f"Final config for task_model instantiation: {config_for_task_model_structure}")
+    task_model = create_mil_model_with_dict(config_for_task_model_structure)
 
-    task_model_state_dict_path = os.path.join(mil_best_model_dir, "..", "best_model.pt")
-    if args.rl_task_model == "ensemble":
-        logger.warning("Ensemble loading for MTL task_model needs careful state_dict alignment.")
-        # Implement ensemble loading if necessary, ensuring compatibility with multi-head task_model
-        # This might involve loading a base and then specific heads if the ensemble was single-task.
-        # For simplicity in initial MTL, you might train task_model from scratch or use a single pre-trained state.
-        # Placeholder for ensemble loading:
-        # ensemble_state_dict_path = os.path.join(mil_best_model_dir, "..", "only_ensemble_loss_sweep_best_rl_model.pt") # Example
-        # if os.path.exists(ensemble_state_dict_path):
-        #     ensemble_state_dict = torch.load(ensemble_state_dict_path, map_location=torch.device("cpu"))
-        #     # Careful mapping to multi-head task_model needed here
-        #     # task_model.load_state_dict(mapped_ensemble_state_dict, strict=False)
-        pass # Requires careful implementation for MTL
-    elif os.path.exists(task_model_state_dict_path):
+    if os.path.exists(task_model_state_dict_path):
         logger.info(f"Loading task_model state_dict from {task_model_state_dict_path}")
         task_model_state_dict = torch.load(task_model_state_dict_path, map_location=torch.device("cpu"))
-        task_model.load_state_dict(task_model_state_dict, strict=False)
+        try:
+            # Attempt to load with strict=True first to catch all mismatches.
+            task_model.load_state_dict(task_model_state_dict, strict=True)
+            logger.info("Successfully loaded task_model state_dict with strict=True.")
+        except RuntimeError as e:
+            logger.warning(f"Strict loading of task_model state_dict failed: {e}. Attempting with strict=False.")
+            task_model.load_state_dict(task_model_state_dict, strict=False)
+            logger.info("Loaded task_model state_dict with strict=False. Some layers might not have been loaded if not present or mismatched.")
     else:
-        logger.info(f"No pre-trained task_model state_dict found at {task_model_state_dict_path}. Training task_model from scratch.")
+        logger.info(f"No pre-trained task_model state_dict found at {task_model_state_dict_path}. "
+                    f"Task_model will use its initial random weights (or be trained from scratch if applicable).")
 
     policy_network = PolicyNetwork(
         task_model=task_model,
-        state_dim=args.state_dim,
-        hdim=args.hdim,
-        learning_rate=args.learning_rate,
+        state_dim=trial_args.state_dim,       # Dimension after task_model's base_network/autoencoder
+        hdim=trial_args.hdim,                 # Hidden dim for PolicyNet's actor/critic (from RL sweep)
+        learning_rate=trial_args.learning_rate, # LR for task_model fine-tuning (from RL sweep)
         device=DEVICE,
-        task_type=args.task_type,
-        min_clip=args.min_clip,
-        max_clip=args.max_clip,
-        sample_algorithm=args.sample_algorithm,
-        no_autoencoder_for_rl=args.no_autoencoder_for_rl,
-        epsilon=args.epsilon
+        task_type=trial_args.task_type,
+        min_clip=getattr(trial_args, 'min_clip', None), # getattr for safety
+        max_clip=getattr(trial_args, 'max_clip', None),
+        sample_algorithm=trial_args.sample_algorithm,
+        no_autoencoder_for_rl=trial_args.no_autoencoder_for_rl,
+        epsilon=trial_args.epsilon
     )
     return policy_network
 
@@ -517,7 +548,17 @@ def train(
 
         if run_name:  # sweep
             current_sweep_metric = eval_ensemble_combined_reward
-            if current_sweep_metric > BEST_REWARD:
+
+            if current_sweep_metric is None: # Explicit check for None
+                logger.warning(
+                    f"Sweep run {run_name}: eval_ensemble_combined_reward is None at epoch {epoch}. "
+                    f"Skipping update of BEST_REWARD."
+                )
+            elif BEST_REWARD is None: # Should not happen if BEST_REWARD is initialized to -np.inf
+                logger.error(f"Sweep run {run_name}: BEST_REWARD is None at epoch {epoch}. This is unexpected. Setting BEST_REWARD to current_sweep_metric ({current_sweep_metric}).")
+                BEST_REWARD = current_sweep_metric
+
+            elif current_sweep_metric > BEST_REWARD:
                 logger.info(
                     f"Sweep run {run_name}: New best model at epoch {epoch}. Combined Ensemble Reward "
                     f"increased ({BEST_REWARD:.6f} --> {current_sweep_metric:.6f})."
@@ -550,7 +591,21 @@ def train(
                 # Evaluate this new best sweep model on test set and save results.json
                 policy_network.eval()
                 test_pool = policy_network.create_pool_data(test_dataloader, bag_size, test_pool_size, random=only_ensemble)
-                detailed_test_metrics_sweep, _, _, _ = policy_network.compute_metrics_and_details(test_pool)
+
+                if test_pool and len(test_pool) > 0:
+                    # Pass the first element of the pool (which is a list of 4-item tuples)
+                    detailed_test_metrics_sweep, _, _, _ = policy_network.compute_metrics_and_details(test_pool[0])
+                else:
+                    # Handle the case where test_pool might be empty or malformed
+                    effective_logger.warning(f"Sweep run {run_name}: test_pool is empty. Cannot compute detailed_test_metrics_sweep.")
+                    detailed_test_metrics_sweep = {}
+                    for task_name_res in args.label: # args is trial_args here
+                        detailed_test_metrics_sweep[f"{task_name_res}/f1"] = 0.0
+                        detailed_test_metrics_sweep[f"{task_name_res}/accuracy"] = 0.0
+                        if args.task_type == 'classification': # Ensure task_type is on args
+                            detailed_test_metrics_sweep[f"{task_name_res}/auc"] = 0.0
+
+                # expected_reward_loss IS designed to take the full pool (list of lists)
                 test_avg_combined_reward_sweep, test_combined_loss_sweep, test_ensemble_combined_reward_sweep = policy_network.expected_reward_loss(test_pool)
 
                 results_json = {
@@ -631,96 +686,141 @@ def train(
 
 
 def main_sweep():
-    global BEST_REWARD, DEVICE, logger
+    global BEST_REWARD, DEVICE, logger, args # Keep global args for initial read
     BEST_REWARD = float("-inf")
 
-    run = wandb.init( # Sweep agent will init this run
-        # tags are set by the sweep config or can be added here
-    )
-    config_from_wandb = wandb.config
+    try:
+        run = wandb.init() # Standard for sweep agent
 
-    # Override args with sweep config. args is the initial parse_args()
-    args.critic_learning_rate = config_from_wandb.critic_learning_rate
-    args.actor_learning_rate = config_from_wandb.actor_learning_rate
-    args.learning_rate = config_from_wandb.learning_rate # For MIL model
-    args.epochs = config_from_wandb.epochs
-    args.hdim = config_from_wandb.hdim # For critic
-    if hasattr(config_from_wandb, 'early_stopping_patience'):
-        args.early_stopping_patience = config_from_wandb.early_stopping_patience
-    args.warmup_epochs = config_from_wandb.get("warmup_epochs", args.warmup_epochs) # Default from initial args if not in sweep
-    args.epsilon = config_from_wandb.get("epsilon", args.epsilon)
-    args.reg_coef = config_from_wandb.get("reg_coef", args.reg_coef)
-    # Other args like batch_size might also be part of the sweep
-    if hasattr(config_from_wandb, 'batch_size'):
-        args.batch_size = config_from_wandb.batch_size
+        # Create a trial-specific configuration object by copying initial args
+        # and then updating with sweep-specific hyperparameters from wandb.config.
+        trial_args = argparse.Namespace(**vars(args)) # Make a shallow copy of the global args
 
-    args.no_wandb = False # Wandb is active for sweeps
+        config_from_wandb = wandb.config
 
-    train_dataset, eval_dataset, test_dataset = prepare_data(args)
-    current_batch_size = args.batch_size if hasattr(args, 'batch_size') and args.batch_size is not None else 32 # Default
+        # Update the trial_args with hyperparameters from the current sweep trial
+        for key, value in config_from_wandb.items():
+            if hasattr(trial_args, key):
+                setattr(trial_args, key, value)
+            else:
+                # If the sweep config has keys not in original args, add them.
+                # This is common for hyperparams defined only in the sweep YAML.
+                setattr(trial_args, key, value)
 
-    if (args.balance_dataset) & (args.task_type == "classification"):
-        sample_weights = get_balanced_weights(train_dataset.Y.tolist())
-        logger.warning("Dataset balancing for MTL needs careful consideration on which task to balance or how to combine.")
-        # Example: balance based on first task's labels
-        first_task_labels = [y_dict[args.label[0]] for y_dict in train_dataset.Y]
-        sample_weights = get_balanced_weights(first_task_labels)
-        w_sampler = WeightedRandomSampler(sample_weights, len(train_dataset.Y), replacement=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=current_batch_size, num_workers=4, sampler=w_sampler)
-    else:
-        train_dataloader = DataLoader(train_dataset, batch_size=current_batch_size, shuffle=True, num_workers=4)
-    eval_dataloader = DataLoader(eval_dataset, batch_size=current_batch_size, shuffle=False, num_workers=4)
-    test_dataloader = DataLoader(test_dataset, batch_size=current_batch_size, shuffle=False, num_workers=4)
+        effective_logger = logger if logger else logging.getLogger("main_sweep_fallback") # Ensure logger exists
 
-    args.input_dim = train_dataset.__getitem__(0)[0].shape[1]
-    if args.autoencoder_layer_sizes is None:
-        args.state_dim = args.input_dim
-    else:
-        args.state_dim = args.autoencoder_layer_sizes[-1]
+        # ===== Robust Epsilon Handling for trial_args =====
+        if not hasattr(trial_args, 'epsilon') or not isinstance(trial_args.epsilon, (int, float)):
+            # This case means epsilon wasn't set by command line (so it was None from parse_args default)
+            # AND it wasn't set by wandb.config (or wandb.config set it to something not a number)
+            effective_logger.warning(
+                f"Epsilon in trial_args was '{getattr(trial_args, 'epsilon', 'Not Set')}' "
+                f"(type: {type(getattr(trial_args, 'epsilon', None))}) after wandb.config update. "
+                f"This indicates an issue with sweep config or initial cmd line args. Defaulting epsilon to 0.1."
+            )
+            trial_args.epsilon = 0.1
+        elif trial_args.epsilon is None: # Explicitly check if it was set to None
+            effective_logger.warning(
+                 f"Epsilon in trial_args was explicitly None after wandb.config update. Defaulting to 0.1."
+            )
+            trial_args.epsilon = 0.1
 
-    # MODEL CREATION
-    # run_dir for this sweep run. Use wandb.run.dir for sweep-specific artifacts.
-    # The main model_save_directory is for the overall experiment, sweep_best_model.pt will go there.
-    target_column_name_for_dir = "_".join(args.label) if isinstance(args.label, list) else args.label
-    run_dir_for_sweep = get_model_save_directory(
-        dataset=args.dataset, data_embedded_column_name=args.data_embedded_column_name,
-        embedding_model_name=args.embedding_model, target_column_name=target_column_name_for_dir,
-        bag_size=args.bag_size, baseline=args.baseline, autoencoder_layers=args.autoencoder_layer_sizes,
-        random_seed=args.random_seed, dev=args.dev, task_type=args.task_type, prefix=args.prefix,
-        multiple_runs=args.multiple_runs
-    )
+        trial_args.no_wandb = False # Ensure wandb logging is enabled for the sweep run
 
-    policy_network = create_rl_model(args, run_dir_for_sweep) # mil_best_model_dir is for loading base MIL model
-    policy_network = policy_network.to(DEVICE)
+        # --- Data Preparation using trial_args ---
+        # prepare_data will now modify trial_args, adding output_dims_dict etc. to it,
+        # not the global args that wandb.init() might have implicitly referenced.
+        train_dataset, eval_dataset, test_dataset = prepare_data(trial_args)
 
-    optimizer = optim.AdamW(
-        [{"params": policy_network.actor.parameters(), "lr": args.actor_learning_rate,},
-         {"params": policy_network.critic.parameters(), "lr": args.critic_learning_rate,}],
-        lr=args.actor_learning_rate, # Fallback, but individual LRs should dominate
-    )
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9) # Example scheduler
+        # --- Update trial_args with data-dependent dimensions ---
+        # These are set on trial_args after prepare_data has potentially added label2id_map etc.
+        trial_args.input_dim = train_dataset.__getitem__(0)[0].shape[1]
+        if trial_args.autoencoder_layer_sizes is None:
+            trial_args.state_dim = trial_args.input_dim
+        else:
+            trial_args.state_dim = trial_args.autoencoder_layer_sizes[-1]
+        # trial_args.output_dims_dict should have been set by prepare_data(trial_args)
 
-    # Early stopping for this specific sweep run's checkpoint (not the global best)
-    # The global "sweep_best_model.pt" is saved within train() based on BEST_REWARD.
-    sweep_run_checkpoint_dir = wandb.run.dir
-    early_stopping_sweep_run = EarlyStopping(
-        models_dir=sweep_run_checkpoint_dir, save_model_name=f"sweep_run_checkpoint.pt",
-        trace_func=logger.info, patience=args.early_stopping_patience, verbose=True, descending=True
-    )
+        logger.info(f"Trial args for this run: {trial_args}")
 
-    train(
-        policy_network=policy_network, optimizer=optimizer, scheduler=scheduler,
-        early_stopping=early_stopping_sweep_run,
-        train_dataloader=train_dataloader, eval_dataloader=eval_dataloader, test_dataloader=test_dataloader,
-        device=DEVICE, bag_size=args.bag_size, epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs, no_wandb=args.no_wandb,
-        train_pool_size=args.train_pool_size, eval_pool_size=args.eval_pool_size, test_pool_size=args.test_pool_size,
-        run_name=run.name,
-        only_ensemble=args.only_ensemble, rl_model=args.rl_model,
-        prefix=args.prefix, epsilon=args.epsilon, reg_coef=args.reg_coef,
-        sample_algorithm=args.sample_algorithm, args=args # Pass full args
-    )
-    run.finish()
+        # --- Model Save Directory for this specific sweep trial (if needed for checkpoints) ---
+        # The main results.json and sweep_best_model.pt will still go to the directory
+        # derived from the initial (global) args.prefix, etc.
+        # WandB automatically creates a run directory (wandb.run.dir) for run-specific artifacts.
+
+        target_column_name_for_dir = "_".join(trial_args.label) if isinstance(trial_args.label, list) else trial_args.label
+        run_dir_for_sweep_trial_checkpoints = get_model_save_directory(
+            dataset=trial_args.dataset, data_embedded_column_name=trial_args.data_embedded_column_name,
+            embedding_model_name=trial_args.embedding_model, target_column_name=target_column_name_for_dir,
+            bag_size=trial_args.bag_size, baseline=trial_args.baseline, autoencoder_layers=trial_args.autoencoder_layer_sizes,
+            random_seed=trial_args.random_seed, dev=trial_args.dev, task_type=trial_args.task_type, prefix=trial_args.prefix,
+            multiple_runs=trial_args.multiple_runs
+        )
+        # Note: The 'sweep_best_model.pt' is usually saved in run_dir_for_sweep_trial_checkpoints based on BEST_REWARD logic in train()
+
+        # --- Dataloaders ---
+        current_batch_size = trial_args.batch_size
+
+        if (trial_args.balance_dataset) and (trial_args.task_type == "classification"):
+            logger.info(f"Using weighted random sampler for MTL (based on first task: {trial_args.label[0]})")
+            first_task_labels = [y_dict[trial_args.label[0]] for y_dict in train_dataset.Y]
+            sample_weights = get_balanced_weights(first_task_labels)
+            w_sampler = WeightedRandomSampler(sample_weights, len(train_dataset.Y), replacement=True)
+            train_dataloader = DataLoader(train_dataset, batch_size=current_batch_size, num_workers=4, sampler=w_sampler)
+        else:
+            train_dataloader = DataLoader(train_dataset, batch_size=current_batch_size, shuffle=True, num_workers=4)
+        eval_dataloader = DataLoader(eval_dataset, batch_size=current_batch_size, shuffle=False, num_workers=4)
+        test_dataloader = DataLoader(test_dataset, batch_size=current_batch_size, shuffle=False, num_workers=4)
+
+        print(trial_args.epsilon, "HEA")
+
+        # --- Model Creation using trial_args ---
+        policy_network = create_rl_model(trial_args, run_dir_for_sweep_trial_checkpoints)
+        policy_network = policy_network.to(DEVICE)
+
+        # --- Optimizer and Scheduler ---
+        optimizer = optim.AdamW(
+            [{"params": policy_network.actor.parameters(), "lr": trial_args.actor_learning_rate},
+            {"params": policy_network.critic.parameters(), "lr": trial_args.critic_learning_rate}],
+            lr=trial_args.actor_learning_rate, # Default overall LR
+        )
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
+        # --- Early Stopping for this sweep trial's checkpoint ---
+        # The global "sweep_best_model.pt" logic in train() handles the best across all sweep runs.
+        # This early_stopping_sweep_run saves a checkpoint for the current trial if it improves.
+        sweep_run_checkpoint_dir = wandb.run.dir # Save trial-specific checkpoints in wandb run dir
+        early_stopping_sweep_run = EarlyStopping(
+            models_dir=sweep_run_checkpoint_dir, save_model_name=f"trial_checkpoint.pt",
+            trace_func=logger.info, patience=trial_args.early_stopping_patience, verbose=True, descending=True
+        )
+
+        # --- Training ---
+        # Pass the trial_args to the train function
+        train(
+            policy_network=policy_network, optimizer=optimizer, scheduler=scheduler,
+            early_stopping=early_stopping_sweep_run, # This saves trial_checkpoint.pt
+            train_dataloader=train_dataloader, eval_dataloader=eval_dataloader, test_dataloader=test_dataloader,
+            device=DEVICE, bag_size=trial_args.bag_size, epochs=trial_args.epochs,
+            warmup_epochs=trial_args.warmup_epochs, no_wandb=trial_args.no_wandb,
+            train_pool_size=trial_args.train_pool_size, eval_pool_size=trial_args.eval_pool_size, test_pool_size=trial_args.test_pool_size,
+            run_name=run.name, # Pass wandb run name for BEST_REWARD logic in train()
+            only_ensemble=trial_args.only_ensemble, rl_model=trial_args.rl_model,
+            prefix=trial_args.prefix, epsilon=trial_args.epsilon, reg_coef=trial_args.reg_coef,
+            sample_algorithm=trial_args.sample_algorithm,
+            args=trial_args # Pass the modified, trial-specific args
+        )
+
+        run.finish()
+    except Exception as e:
+        print(f"!!!!!!!! Exception caught in main_sweep for run {run.id if run else 'UNKNOWN'} !!!!!!!!")
+        print(f"Error Type: {type(e)}")
+        print(f"Error Message: {e}")
+        print("Full Traceback:")
+        traceback.print_exc() # This will print the traceback to your console/output.log
+        if run:
+            run.finish(exit_code=1)
+        raise
 
 
 def main():
@@ -865,7 +965,7 @@ if __name__ == "__main__":
 
         logger.info(f"Starting W&B sweep with ID: {args.sweep_config.get('name', 'N/A')}")
         sweep_id = wandb.sweep(args.sweep_config, entity=args.wandb_entity, project=args.wandb_project)
-        wandb.agent(sweep_id, function=main_sweep, count=args.sweep_config.get('run_cap', 50)) # Pass main_sweep
+        wandb.agent(sweep_id, function=main_sweep, count=args.sweep_config.get('run_cap', 50))
     else:
         # args.run_name = f"{args.prefix}_{args.dataset}_{label_str_for_sweep}_rl_{args.baseline}_no_sweep" # Set for single run if needed
         main()

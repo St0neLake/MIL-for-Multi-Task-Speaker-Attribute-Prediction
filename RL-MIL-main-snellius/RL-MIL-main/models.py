@@ -694,7 +694,12 @@ class PolicyNetwork(nn.Module):
         self.task_type_global = kwargs['task_type']
         self.min_clip = kwargs['min_clip']
         self.max_clip = kwargs['max_clip']
-        self.epsilon = kwargs.get('epsilon', 0.1)
+        kwarg_epsilon = kwargs.get('epsilon') # Get epsilon from kwargs
+        if kwarg_epsilon is not None and isinstance(kwarg_epsilon, (int, float)):
+            self.epsilon = float(kwarg_epsilon)
+        else:
+            print(f"PolicyNetwork __init__: Epsilon from kwargs was '{kwarg_epsilon}' (type: {type(kwarg_epsilon)}). Defaulting self.epsilon to 0.1")
+            self.epsilon = 0.1
         self.sample_algorithm = kwargs.get('sample_algorithm', 'with_replacement')
         self.no_autoencoder = kwargs.get('no_autoencoder', False)
 
@@ -722,6 +727,14 @@ class PolicyNetwork(nn.Module):
         exp_reward = self.critic(batch_rep)
         action_probs = self.actor(batch_rep)
         action_probs = action_probs.squeeze(-1)
+        # ---- START DEBUG ----
+        if torch.any(torch.sum(action_probs, dim=1) == 0):
+            problematic_bags = action_probs[torch.sum(action_probs, dim=1) == 0]
+            print(f"WARNING PolicyNetwork.forward: Found bags where action_probs sum to 0! Values: {problematic_bags}")
+
+        if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+            print(f"ERROR PolicyNetwork.forward: action_probs contain NaN or Inf! Values: {action_probs}")
+        # ---- END DEBUG ----
         exp_reward = torch.mean(exp_reward, dim=1)
         return action_probs, batch_rep, exp_reward
 
@@ -942,42 +955,115 @@ class PolicyNetwork(nn.Module):
             list_of_batches.append(data)
         return list_of_batches
 
-    def expected_reward_loss(self, pool_data, average='macro', verbos=False):
+    def expected_reward_loss(self, pool_data, average='macro', verbos=False): # [cite: 1]
+        # pool_data is a list of lists. Each inner list is the result of one select_from_dataloader call.
+        # Each item in the inner list is a tuple: (sel_x_for_bag_item, batch_y_dict_for_bag_item, index_for_bag_item, current_instance_labels)
+
         reward_pool, loss_pool = [], []
 
         task_ensembled_preds = {task_name: [] for task_name in self.task_names}
         task_labels_for_ensemble = {task_name: None for task_name in self.task_names}
 
-        first_call = True
-        for data_idx, data_item in enumerate(pool_data): # pool_data is a list of (list of batches)
-            reward, loss, preds_dict, labels_dict = self.compute_reward(data_item) # compute_reward now returns dicts
-            reward_pool.append(reward)
-            loss_pool.append(loss)
+        # Check if pool_data itself or its first element (a list of batches/items from one selection run) is empty
+        if not pool_data or not pool_data[0]:
+            # logger is not defined in this scope, but ideally, you'd log this.
+            # For now, printing a warning. In your actual code, ensure 'logger' is accessible.
+            print("WARNING: expected_reward_loss - pool_data is empty or its first selection run is empty. Returning default 0.0 rewards/loss.")
+            return 0.0, 0.0, 0.0
+
+        first_data_load_for_labels = True # To get labels for ensemble F1 calculation just once
+        for data_selection_run in pool_data: # Each item is a list of (sel_x, y_dict, idx, inst_labels) tuples from one policy rollout
+            if not data_selection_run:
+                # This means one of the policy rollouts/selections over the dataloader resulted in no data.
+                # This could happen if select_from_dataloader returned an empty list.
+                print("WARNING: expected_reward_loss - A data_selection_run in pool_data is empty. Appending default reward/loss for this run.")
+                reward_pool.append(0.0)
+                loss_pool.append(0.0) # Use 0.0 for loss to avoid NaN issues with np.mean if all are problematic
+                # For ensemble predictions, this run contributes nothing or needs careful handling.
+                # For simplicity, we'll let the existing logic for task_ensembled_preds handle potentially shorter lists.
+                continue
+
+            # compute_reward expects a list of these tuples (effectively, a batch of selected bags)
+            reward, loss, preds_dict_for_run, labels_dict_for_run = self.compute_reward(data_selection_run)
+
+            reward_pool.append(reward if reward is not None and not np.isnan(reward) else 0.0)
+            loss_pool.append(loss if loss is not None and not np.isnan(loss) else 0.0)
 
             for task_name in self.task_names:
-                task_ensembled_preds[task_name].append(preds_dict[task_name])
-                if first_call: # Assuming labels are the same across the pool for a given task
-                    task_labels_for_ensemble[task_name] = labels_dict[task_name]
-            first_call = False
+                if task_name in preds_dict_for_run and preds_dict_for_run[task_name] is not None:
+                    # Ensure preds_dict_for_run[task_name] is a tensor before appending
+                    # compute_reward should return tensors for predictions
+                    if isinstance(preds_dict_for_run[task_name], torch.Tensor):
+                        task_ensembled_preds[task_name].append(preds_dict_for_run[task_name])
+                    else:
+                        # This case should ideally not happen if compute_reward is consistent
+                        print(f"WARNING: Preds for task {task_name} in one run was not a tensor.")
+
+                if first_data_load_for_labels and task_name in labels_dict_for_run and labels_dict_for_run[task_name] is not None:
+                     if isinstance(labels_dict_for_run[task_name], torch.Tensor):
+                        task_labels_for_ensemble[task_name] = labels_dict_for_run[task_name]
+                     else:
+                        print(f"WARNING: Labels for task {task_name} in first run was not a tensor.")
+            first_data_load_for_labels = False
+
+        # Calculate mean reward and loss, handling empty or all-NaN cases
+        mean_reward = np.mean(reward_pool) if reward_pool and not all(np.isnan(r) or r is None for r in reward_pool) else 0.0
+        mean_loss = np.mean(loss_pool) if loss_pool and not all(np.isnan(l) or l is None for l in loss_pool) else 0.0
 
         ensemble_f1_scores_per_task = {}
         for task_name in self.task_names:
-            if task_labels_for_ensemble[task_name] is not None and task_ensembled_preds[task_name]:
-                stacked_preds_for_task = torch.stack(task_ensembled_preds[task_name], dim=0) # Shape: (pool_size, num_samples)
-                ensembled_final_preds_task, _ = torch.mode(stacked_preds_for_task, dim=0)
+            if task_labels_for_ensemble[task_name] is not None and len(task_labels_for_ensemble[task_name]) > 0 and \
+               task_name in task_ensembled_preds and task_ensembled_preds[task_name]:
 
-                labels_task = task_labels_for_ensemble[task_name]
-                ensemble_f1_scores_per_task[task_name] = f1_score(labels_task.data.numpy(),
-                                                                  ensembled_final_preds_task.data.numpy(),
+                # Filter out any potential non-tensor entries if they slipped through (defensive)
+                valid_preds_for_stack = [p for p in task_ensembled_preds[task_name] if isinstance(p, torch.Tensor) and p.ndim > 0]
+
+                if not valid_preds_for_stack:
+                    # print(f"WARNING: No valid tensor predictions for task {task_name} for ensemble F1 calculation.")
+                    ensemble_f1_scores_per_task[task_name] = 0.0
+                    continue
+
+                try:
+                    # Assuming predictions are class indices (1D tensors per selection run)
+                    # Shape of each p in valid_preds_for_stack should be (num_samples_in_batch_from_selection_run)
+                    # We need to ensure they are concatenable or stackable. If num_samples varies, mode might be tricky.
+                    # Assuming for now each selection run processes the same set of eval items.
+                    stacked_preds_for_task = torch.stack(valid_preds_for_stack, dim=0) # Shape: (pool_size, num_samples)
+                    ensembled_final_preds_task, _ = torch.mode(stacked_preds_for_task, dim=0)
+
+                    labels_task_np = task_labels_for_ensemble[task_name].data.cpu().numpy()
+                    ensembled_preds_np = ensembled_final_preds_task.data.cpu().numpy()
+
+                    if len(np.unique(labels_task_np)) < 2 and len(labels_task_np) > 0: # Only one class present in true labels
+                         # print(f"INFO: Only one class present in true labels for task {task_name}. F1 is 0 if predictions differ, or 1 if all match (problematic for macro F1). Defaulting to 0 for safety.")
+                         f1_val = 0.0
+                         if np.all(labels_task_np == ensembled_preds_np): # If all preds match the single true class
+                             # This edge case might need specific handling depending on desired F1 interpretation
+                             # For macro-F1 with single true class, scikit-learn might warn or give 0.
+                             # Let's assume if perfect match to single class, it's 1.0 (for that class), but macro needs care.
+                             # Scikit-learn f1_score with average='macro' and single class in y_true typically gives 0 unless y_pred also only has that class.
+                              pass # f1_val stays 0.0 or as per scikit-learn's behavior for single class.
+
+                    ensemble_f1_scores_per_task[task_name] = f1_score(labels_task_np,
+                                                                  ensembled_preds_np,
                                                                   average=average, zero_division=0)
+                except Exception as e:
+                    print(f"ERROR: Calculating ensemble F1 for task {task_name}: {e}")
+                    ensemble_f1_scores_per_task[task_name] = 0.0
             else:
-                ensemble_f1_scores_per_task[task_name] = 0.0 # Default if no preds/labels
+                # print(f"INFO: Not enough data to calculate ensemble F1 for task {task_name}.")
+                ensemble_f1_scores_per_task[task_name] = 0.0
 
-        ensemble_reward = np.mean(list(ensemble_f1_scores_per_task.values()))
+        ensemble_f1_values = list(ensemble_f1_scores_per_task.values())
+        valid_f1_values_ens = [f1 for f1 in ensemble_f1_values if isinstance(f1, (int, float)) and not np.isnan(f1)]
+        ensemble_reward = np.mean(valid_f1_values_ens) if valid_f1_values_ens else 0.0
 
-        mean_reward = np.mean(reward_pool)
-        mean_loss = np.mean(loss_pool)
-        return mean_reward, mean_loss, ensemble_reward
+        # Ensure all returned values are floats and not None or NaN
+        final_mean_reward = mean_reward if isinstance(mean_reward, (int, float)) and not np.isnan(mean_reward) else 0.0
+        final_mean_loss = mean_loss if isinstance(mean_loss, (int, float)) and not np.isnan(mean_loss) else 0.0
+        final_ensemble_reward = ensemble_reward if isinstance(ensemble_reward, (int, float)) and not np.isnan(ensemble_reward) else 0.0
+
+        return final_mean_reward, final_mean_loss, final_ensemble_reward
 
     def predict(self, data_batches):
         self.task_model.eval()

@@ -319,7 +319,7 @@ def parse_args():
                 if args.only_ensemble:
                     config_file = f"hp_ensemble_loss.yaml"
                 elif args.rl_model == "policy_only":
-                    config_file = f"hp_rl_{args.rl_model}_{args.prefix}.yaml"
+                    config_file = f"hp_rl_mtl_loss.yaml"
                 else:
                     config_file = f"hp_rl_{args.prefix}.yaml"
             else:
