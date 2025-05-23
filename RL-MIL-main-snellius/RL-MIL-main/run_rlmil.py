@@ -457,7 +457,7 @@ def train(
                     detailed_eval_metrics[f"{task_name}/auc"] = 0.0
             detailed_eval_metrics['loss'] = float('nan')
 
-        early_stopping(eval_avg_combined_reward, policy_network) # Early stopping based on combined reward
+        early_stopping(eval_avg_combined_reward, policy_network, epoch=epoch) # Early stopping based on combined reward
 
         if not no_wandb:
             train_eval_pool = policy_network.create_pool_data(train_dataloader, bag_size, eval_pool_size, random=only_ensemble) # Using eval_pool_size for consistency
@@ -590,13 +590,16 @@ def train(
             logger.info(f"Early stopping at epoch {epoch} out of {epochs}")
             break
 
-    # Load the best model based on early_stopping for final evaluation
+    # Inside the train function in run_rlmil.py, after the loop
     logger.info(f"Loading best model from epoch {early_stopping.best_epoch if hasattr(early_stopping, 'best_epoch') else 'N/A'}")
-    policy_network.load_state_dict(torch.load(early_stopping.model_address))
+    if early_stopping.model_address and os.path.exists(early_stopping.model_address):
+        policy_network.load_state_dict(torch.load(early_stopping.model_address))
+    else:
+        logger.warning("Could not load best model from early stopping: model_address not set or file does not exist.")
     policy_network.eval()
 
     final_test_pool = policy_network.create_pool_data(test_dataloader, bag_size, test_pool_size, random=only_ensemble)
-    final_detailed_test_metrics, _, _, _ = policy_network.compute_metrics_and_details(final_test_pool)
+    final_detailed_test_metrics, _, _, _ = policy_network.compute_metrics_and_details(final_test_pool[0])
     final_test_avg_reward, final_test_combined_loss, final_test_ensemble_reward = policy_network.expected_reward_loss(final_test_pool)
 
     final_log_summary = {

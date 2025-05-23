@@ -34,10 +34,7 @@ class BaseNetwork(nn.Module):
 
     def forward(self, x):
         if self.layer_sizes:
-            # batch_size, bag_size, d = x.size()
-            # x = x.view(batch_size * bag_size, d)
             x = self.net(x)
-            # x = x.view(batch_size, bag_size, -1)
         return x
 
 
@@ -84,21 +81,22 @@ class BaseMLP(nn.Module, ABC):
             autoencoder_layer_sizes=None,
     ):
         super(BaseMLP, self).__init__()
-        self.input_dim_for_heads = input_dim # This is the dimension of the aggregated features
-        self.hidden_dim = hidden_dim
+        self.input_dim_for_aggregation = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
+        self.hidden_dim_for_heads = hidden_dim
         self.output_dims_dict = output_dims_dict
-        self.dropout_p = dropout_p  # register the droupout probability as a buffer
+        self.dropout_p = dropout_p
 
         self.autoencoder_layer_sizes = autoencoder_layer_sizes
-        self.base_network = BaseNetwork(self.autoencoder_layer_sizes)
+        self.base_network = BaseNetwork(self.autoencoder_layer_sizes) # Processes instance embeddings
 
         self.task_heads = nn.ModuleDict()
-        for task_name, num_classes in self.output_dims_dict.items():
+        # The input to these heads is the result of self.aggregate(), which should have self.input_dim_for_aggregation dimension
+        for task_name, num_classes_for_task in self.output_dims_dict.items():
             self.task_heads[task_name] = nn.Sequential(
-                nn.Linear(self.input_dim_for_heads, self.hidden_dim),
+                nn.Linear(self.input_dim_for_aggregation, self.hidden_dim_for_heads),
                 nn.ReLU(),
                 nn.Dropout(p=self.dropout_p),
-                nn.Linear(self.hidden_dim, num_classes),
+                nn.Linear(self.hidden_dim_for_heads, num_classes_for_task),
             )
 
         self.initialize_weights()
@@ -107,11 +105,12 @@ class BaseMLP(nn.Module, ABC):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.base_network(x)
-        aggregated_x = self.aggregate(x)  # Aggregate the data
+        aggregated_x = self.aggregate(x)
 
         outputs = {}
         for task_name, head in self.task_heads.items():
@@ -201,7 +200,7 @@ class AttentionMLP(BaseMLP):
             dropout_p,
             autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
-        self.attention = None
+        # self.attention = None
         self.is_linear_attention = is_linear_attention
         self.attention_size = attention_size
         self.attention_dropout_p = attention_dropout_p
@@ -214,7 +213,7 @@ class AttentionMLP(BaseMLP):
             self.attention_mechanism = nn.Linear(self.attention_input_dim, 1)
         else:
             self.attention_mechanism = torch.nn.Sequential(
-                torch.nn.Linear(self.attention_input_dim, self.attention_size), # MODIFIED
+                torch.nn.Linear(self.attention_input_dim, self.attention_size),
                 torch.nn.Dropout(p=self.attention_dropout_p),
                 torch.nn.Tanh(),
                 torch.nn.Linear(self.attention_size, 1),
@@ -265,24 +264,22 @@ class ApproxRepSet(nn.Module):
     def init_weights(self):
         nn.init.xavier_uniform_(self.Wc.data)
         nn.init.xavier_uniform_(self.fc1.weight.data)
-        if self.fc1.bias is not None: nn.init.zeros_(self.fc1.bias.data)
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias.data)
 
-        for task_name in self.task_heads: # Initialize new heads
+        for task_name in self.task_heads:
             nn.init.xavier_uniform_(self.task_heads[task_name].weight.data)
             if self.task_heads[task_name].bias is not None:
                  nn.init.zeros_(self.task_heads[task_name].bias.data)
 
-    def forward(self, x):  # x: (batch_size, bag_size, d)
-        t = self.base_network(x)  # t: (batch_size, bag_size, d)
-        t = self.relu(
-            torch.matmul(t, self.Wc)
-        )  # t: (batch_size, bag_size, n_hidden_sets * n_elements)
-        t = t.view(
-            t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets
-        )  # t: (batch_size, bag_size, n_elements, n_hidden_sets)
-        t, _ = torch.max(t, dim=2)  # t: (batch_size, bag_size, n_hidden_sets)
-        t = torch.sum(t, dim=1)  # t: (batch_size, n_hidden_sets)
-        t = self.relu(self.fc1(t))  # t: (batch_size, 32)
+    def forward(self, x):
+        t = self.base_network(x)
+        t = self.relu(torch.matmul(t, self.Wc))
+        t = t.view(t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets)
+        t, _ = torch.max(t, dim=2)
+        t = torch.sum(t, dim=1)
+        t = self.relu(self.fc1(t))
+
         outputs = {}
         for task_name, head in self.task_heads.items():
             outputs[task_name] = head(t)
@@ -421,91 +418,154 @@ def majority_model(train_dataframe, test_dataframe, args, logger):
     # Log the confusion matrix
     logger.info(f"Confusion matrix:\n{cm}")
 
-def create_mil_model(args):
-    mil_input_dim = args.input_dim
+def create_mil_model(args): # args is expected to be a Namespace or dict-like object
+    if not hasattr(args, 'output_dims_dict') or not args.output_dims_dict:
+        if hasattr(args, 'number_of_classes') and hasattr(args, 'label') and isinstance(args.label, str):
+            # Fallback for single-task like configuration if needed for some legacy calls
+            print("Warning (create_mil_model): 'output_dims_dict' not found in args. Assuming single-task setup based on 'number_of_classes' and 'label'.")
+            output_dims_dict = {args.label: args.number_of_classes}
+        else:
+            raise ValueError("'output_dims_dict' is required in args for create_mil_model in MTL setup.")
+    else:
+        output_dims_dict = args.output_dims_dict
+
+    if not hasattr(args, 'input_dim') or args.input_dim is None:
+        raise ValueError("'input_dim' must be set in args for create_mil_model.")
+    mil_input_dim = args.input_dim # Use args.input_dim
+
+    # Ensure other necessary args are present, providing defaults if they might be missing from sweep config
+    hidden_dim = getattr(args, 'hidden_dim', 64) # Example default
+    dropout_p = getattr(args, 'dropout_p', 0.5)   # Example default
+    autoencoder_layer_sizes = getattr(args, 'autoencoder_layer_sizes', None)
+    n_hidden_sets = getattr(args, 'n_hidden_sets', None) # Specific to repset
+    n_elements = getattr(args, 'n_elements', None)       # Specific to repset
+    is_linear_attention = getattr(args, 'is_linear_attention', True) # Specific to AttentionMLP
+    attention_size = getattr(args, 'attention_size', 64)             # Specific to AttentionMLP
+
 
     if args.baseline == "MaxMLP":
         model = MaxMLP(
-            input_dim=args.mil_input_dim ,
-            hidden_dim=args.hidden_dim,
-            output_dims_dict=args.output_dims_dict,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif args.baseline == "MeanMLP":
         model = MeanMLP(
-            input_dim=args.mil_input_dim ,
-            hidden_dim=args.hidden_dim,
-            output_dims_dict=args.output_dims_dict,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif args.baseline == "AttentionMLP":
         model = AttentionMLP(
-            input_dim=args.mil_input_dim ,
-            hidden_dim=args.hidden_dim,
-            output_dims_dict=args.output_dims_dict,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+            is_linear_attention=is_linear_attention,
+            attention_size=attention_size
         )
     elif args.baseline == "repset":
+        if n_hidden_sets is None or n_elements is None:
+            raise ValueError("'n_hidden_sets' and 'n_elements' are required for repset baseline.")
         model = ApproxRepSet(
-            input_dim=args.mil_input_dim ,
-            n_hidden_sets=args.n_hidden_sets,
-            n_elements=args.n_elements,
-            output_dims_dict=args.output_dims_dict,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            n_hidden_sets=n_hidden_sets,
+            n_elements=n_elements,
+            output_dims_dict=output_dims_dict,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+        )
+    elif args.baseline == "SimpleMLP": # This is likely for non-MIL baseline comparison
+        if not output_dims_dict:
+             raise ValueError("output_dims_dict cannot be empty for SimpleMLP in MTL context.")
+        first_task_output_dim = next(iter(output_dims_dict.values()))
+        model = SimpleMLP(
+            input_dim=mil_input_dim, # SimpleMLP typically takes aggregated/mean features
+            hidden_dim=hidden_dim,
+            output_dim=first_task_output_dim,
+            dropout_p=dropout_p
         )
     else:
-        model = None
+        raise ValueError(f"Unsupported baseline: {args.baseline} in create_mil_model")
     return model
 
 
-def create_mil_model_with_dict(config: dict):
+def create_mil_model_with_dict(config: dict): # config is a dictionary
+    if 'output_dims_dict' not in config or not config['output_dims_dict']:
+        if 'number_of_classes' in config and 'label' in config and isinstance(config['label'], str):
+            print("Warning (create_mil_model_with_dict): 'output_dims_dict' not found. Assuming single-task from 'number_of_classes'.")
+            output_dims_dict = {config['label']: config['number_of_classes']}
+        else:
+            raise ValueError("'output_dims_dict' is required in config for create_mil_model_with_dict for MTL.")
+    else:
+        output_dims_dict = config['output_dims_dict']
+
+    if 'input_dim' not in config or config['input_dim'] is None:
+        raise ValueError("'input_dim' must be set in config for create_mil_model_with_dict.")
     mil_input_dim = config["input_dim"]
+
+    # Ensure other necessary config keys are present with defaults
+    hidden_dim = config.get('hidden_dim', 64)
+    dropout_p = config.get('dropout_p', 0.5)
+    autoencoder_layer_sizes = config.get("autoencoder_layer_sizes")
+    n_hidden_sets = config.get('n_hidden_sets') # Specific to repset
+    n_elements = config.get('n_elements')       # Specific to repset
+    is_linear_attention = config.get('is_linear_attention', True) # Specific to AttentionMLP
+    attention_size = config.get('attention_size', 64)             # Specific to AttentionMLP
+
+
     if config['baseline'] == "MaxMLP":
         model = MaxMLP(
             input_dim=mil_input_dim,
-            hidden_dim=config["hidden_dim"],
-            output_dims_dict=config["output_dims_dict"],
-            dropout_p=config["dropout_p"],
-            autoencoder_layer_sizes=config.get("autoencoder_layer_sizes"),
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif config['baseline'] == "MeanMLP":
         model = MeanMLP(
             input_dim=mil_input_dim,
-            hidden_dim=config["hidden_dim"],
-            output_dims_dict=config["output_dims_dict"],
-            dropout_p=config["dropout_p"],
-            autoencoder_layer_sizes=config.get("autoencoder_layer_sizes"),
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif config['baseline'] == "AttentionMLP":
         model = AttentionMLP(
             input_dim=mil_input_dim,
-            hidden_dim=config["hidden_dim"],
-            output_dims_dict=config["output_dims_dict"],
-            dropout_p=config["dropout_p"],
-            autoencoder_layer_sizes=config.get("autoencoder_layer_sizes"),
-            is_linear_attention=config.get("is_linear_attention", True),
-            attention_size=config.get("attention_size", 64)
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+            is_linear_attention=is_linear_attention,
+            attention_size=attention_size
         )
     elif config['baseline'] == "repset":
+        if n_hidden_sets is None or n_elements is None:
+            raise ValueError("'n_hidden_sets' and 'n_elements' are required for repset baseline in config.")
         model = ApproxRepSet(
             input_dim=mil_input_dim,
-            n_hidden_sets=config["n_hidden_sets"],
-            n_elements=config["n_elements"],
-            output_dims_dict=config["output_dims_dict"],
-            autoencoder_layer_sizes=config.get("autoencoder_layer_sizes"),
+            n_hidden_sets=n_hidden_sets,
+            n_elements=n_elements,
+            output_dims_dict=output_dims_dict,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif config['baseline'] == "SimpleMLP":
+        if not output_dims_dict:
+             raise ValueError("output_dims_dict cannot be empty for SimpleMLP in MTL context in config.")
+        first_task_output_dim = next(iter(output_dims_dict.values()))
         model = SimpleMLP(
             input_dim=mil_input_dim,
-            hidden_dim=config["hidden_dim"],
-            output_dim=config["output_dims_dict"],
-            dropout_p=config["dropout_p"],
+            hidden_dim=hidden_dim,
+            output_dim=first_task_output_dim,
+            dropout_p=dropout_p,
         )
     else:
-        model = None
+        raise ValueError(f"Unsupported baseline: {config['baseline']} in create_mil_model_with_dict")
     return model
 
 
@@ -517,22 +577,17 @@ def init_weights(m):
 class ActorNetwork(nn.Module):
     def __init__(self, **kwargs):
         super(ActorNetwork, self).__init__()
-        # self.args = args
         self.state_dim = kwargs['state_dim']
-        # self.actor = nn.Linear(self.state_dim, 2)
         self.actor  = nn.Sequential(
             nn.Linear(self.state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 32),
             nn.ReLU(),
-            # nn.Linear(32, 2),
             nn.Linear(32, 1),
         )
         self.actor.apply(init_weights)
-        # nn.init.xavier_uniform_(self.actor.weight)
 
     def forward(self, x):
-        # action_probs = F.softmax(self.actor(x), dim=-1)
         action_probs = F.sigmoid(self.actor(x))
         return action_probs
 
@@ -639,6 +694,7 @@ class PolicyNetwork(nn.Module):
         self.task_type_global = kwargs['task_type']
         self.min_clip = kwargs['min_clip']
         self.max_clip = kwargs['max_clip']
+        self.epsilon = kwargs.get('epsilon', 0.1)
         self.sample_algorithm = kwargs.get('sample_algorithm', 'with_replacement')
         self.no_autoencoder = kwargs.get('no_autoencoder', False)
 
@@ -679,18 +735,59 @@ class PolicyNetwork(nn.Module):
         for i, r in enumerate(self.rewards):
             self.rewards[i] = float((r - R_mean) / (R_std + eps))
 
-    def select_from_dataloader(self, dataloader, bag_size, random=False):
-        with torch.no_grad():
-            data = []
-            for batch_x, batch_y, indices, instance_labels in dataloader:
-                batch_x = batch_x.to(self.device)
-                # select batch_x
-                action_probs, _, _ = self.forward(batch_x)
-                action, _ = sample_action(action_probs, bag_size, self.device, random=random, algorithm=self.sample_algorithm)
-                batch_x = select_from_action(action, batch_x)
-                batch_x = batch_x.cpu()
-                data.append((batch_x, batch_y, indices, instance_labels))
-        return data
+    def select_from_dataloader(self, dataloader, device, bag_size, sample_algorithm, only_ensemble=False, epsilon=0.1):
+        data_pool_items = []
+
+        for batch_x_orig, batch_y_dict_orig, indices_orig, instance_labels_orig_batch in dataloader:
+            batch_x_orig = batch_x_orig.to(device)
+            action_probs, _, _ = self.forward(batch_x_orig)
+
+            action, _ = sample_action(
+                action_probs,
+                bag_size, # bag_size here is the number of items to select (k)
+                device=device,
+                random=(epsilon > np.random.random()) or only_ensemble,
+                algorithm=sample_algorithm
+            )
+
+            # Get the selected instances based on the actions
+            sel_x = select_from_action(action, batch_x_orig)
+
+            # Iterate through each bag in the original batch to create items for the pool
+            for i in range(len(batch_x_orig)):
+                sel_x_for_bag_item = sel_x[i].unsqueeze(0).cpu()
+
+                batch_y_dict_for_bag_item = {
+                    task: label_tensor[i].unsqueeze(0).cpu()
+                    for task, label_tensor in batch_y_dict_orig.items()
+                }
+
+                index_for_bag_item = indices_orig[i].cpu()
+
+                current_instance_labels = [] # Default
+                if instance_labels_orig_batch is not None:
+                    if isinstance(instance_labels_orig_batch, torch.Tensor) and instance_labels_orig_batch.ndim > 0 : # If it's a batched tensor
+                         if i < len(instance_labels_orig_batch): # Check bounds
+                            current_instance_labels = instance_labels_orig_batch[i].cpu() # If tensor, get i-th element
+                    elif isinstance(instance_labels_orig_batch, list):
+                        if i < len(instance_labels_orig_batch): # Check bounds
+                            item_instance_label = instance_labels_orig_batch[i]
+                            if isinstance(item_instance_label, torch.Tensor):
+                                current_instance_labels = item_instance_label.cpu()
+                            else: # Assuming it's already a list or suitable structure
+                                current_instance_labels = item_instance_label
+                    # If instance_labels_orig_batch is just one item (e.g. an empty list passed for all), handle appropriately
+                    elif not isinstance(instance_labels_orig_batch, list) and not isinstance(instance_labels_orig_batch, torch.Tensor) and i==0:
+                         current_instance_labels = instance_labels_orig_batch # Should ideally be a list per bag
+
+
+                data_pool_items.append((
+                    sel_x_for_bag_item,
+                    batch_y_dict_for_bag_item,
+                    index_for_bag_item,
+                    current_instance_labels  # The (potentially processed) instance labels for this one bag
+                ))
+        return data_pool_items
 
     def compute_reward(self, eval_data):
         with torch.no_grad():
@@ -830,11 +927,20 @@ class PolicyNetwork(nn.Module):
         return batch_out, total_loss.item(), individual_losses # Return dict of outs, combined loss
 
     def create_pool_data(self, dataloader, bag_size, pool_size, random=False):
-        pool = []
+        list_of_batches = []
         for _ in range(pool_size):
-            data = self.select_from_dataloader(dataloader, bag_size, random=random)
-            pool.append(data)
-        return pool
+            current_epsilon = getattr(self, 'epsilon', 0.1)
+
+            data = self.select_from_dataloader(
+                dataloader=dataloader,
+                device=self.device,
+                bag_size=bag_size,
+                sample_algorithm=self.sample_algorithm,
+                only_ensemble=random,
+                epsilon=current_epsilon
+            )
+            list_of_batches.append(data)
+        return list_of_batches
 
     def expected_reward_loss(self, pool_data, average='macro', verbos=False):
         reward_pool, loss_pool = [], []

@@ -3,7 +3,8 @@ import os
 import pickle
 import random
 from argparse import Namespace
-from typing import Optional, List
+from typing import Optional, List, Dict
+from argparse import Namespace
 
 import numpy as np
 import pandas as pd
@@ -101,37 +102,74 @@ def r2_score_with_clip(yt, yt_hat, min_clip, max_clip):
     return score
 
 
-def get_classification_metrics(model, dataloader, device, average='macro', detailed=False):
+def get_classification_metrics(model, dataloader, device, target_task_name: str, average='macro', detailed=False): # ADDED target_task_name
     model.eval()
-    all_y = []
-    all_y_hat = []
-    all_y_hat_prob = []
+    all_y_task = []
+    all_y_hat_task = []
+    all_y_hat_prob_task = []
+
     for batch in dataloader:
-        x, y = batch[0], batch[1]
+        x, y_dict = batch[0], batch[1] # y_dict is a dict of label tensors {'task1': tensor, 'task2': tensor}
         x = x.to(device)
-        output = model(x)
-        output = F.softmax(output, dim=1)
-        y_prob = torch.softmax(output, dim=1)
-        y_hat = torch.argmax(output, dim=1).cpu()
-        all_y_hat.extend(y_hat.tolist())
-        y = y.to(torch.int64)
-        all_y.extend(y.tolist())
-        all_y_hat_prob.extend(y_prob.cpu().detach().tolist())
+
+        output_dict = model(x) # model(x) should return a dict of output tensors {'task1': logits, 'task2': logits}
+
+        # Use target_task_name to get the specific task's output and labels
+        if target_task_name not in output_dict:
+            available_keys = list(output_dict.keys()) if isinstance(output_dict, dict) else "Output is not a dict"
+            raise ValueError(f"Task '{target_task_name}' not found in model output keys. Available: {available_keys}")
+        if not isinstance(y_dict, dict) or target_task_name not in y_dict:
+            available_keys = list(y_dict.keys()) if isinstance(y_dict, dict) else "Labels are not a dict"
+            raise ValueError(f"Task '{target_task_name}' not found in label dictionary keys. Available: {available_keys}")
+
+        output_task = output_dict[target_task_name]
+        y_task = y_dict[target_task_name] # This is the tensor for the target task
+
+        # Assuming output_task are logits for classification
+        y_prob_task = F.softmax(output_task, dim=1)
+        y_hat_task_batch = torch.argmax(output_task, dim=1).cpu()
+
+        all_y_hat_task.extend(y_hat_task_batch.tolist())
+        all_y_task.extend(y_task.cpu().tolist()) # Ensure y_task is on CPU and converted
+        all_y_hat_prob_task.extend(y_prob_task.cpu().detach().tolist())
+
+    if not all_y_task: # Handle empty evaluation case (e.g., if dataloader was empty)
+        print(f"Warning: No data processed for task '{target_task_name}' in get_classification_metrics. Returning zero metrics.")
+        metrics = {"acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "f1_micro": 0.0, "auc": 0.0}
+        if not detailed:
+            return metrics
+        return metrics, [], [], []
 
     precision, recall, f1, _ = precision_recall_fscore_support(
-        all_y, all_y_hat, average=average, zero_division=0
+        all_y_task, all_y_hat_task, average=average, zero_division=0
     )
-    f1_micro = f1_score(all_y, all_y_hat, average="micro")
-    all_y, all_y_hat_prob= np.array(all_y), np.array(all_y_hat_prob)
-    # print(all_y)
-    # print(all_y_hat_prob)
-    # print(all_y.shape, all_y_hat_prob.shape)
-    if all_y_hat_prob.shape[1] == 2:
-        auc = roc_auc_score(all_y, all_y_hat_prob[:, 1], average='macro')
+    f1_micro = f1_score(all_y_task, all_y_hat_task, average="micro", zero_division=0)
+    acc = accuracy_score(all_y_task, all_y_hat_task)
+
+    all_y_np = np.array(all_y_task)
+    all_y_hat_prob_np = np.array(all_y_hat_prob_task)
+
+    auc = 0.0 # Default AUC
+    if all_y_np.size > 0 and all_y_hat_prob_np.size > 0: # Check if not empty
+        if len(np.unique(all_y_np)) > 1: # Needs at least two classes in y_true for AUC
+            if all_y_hat_prob_np.ndim == 2 and all_y_hat_prob_np.shape[1] >= 2: # Check for valid probability array shape
+                if all_y_hat_prob_np.shape[1] == 2: # Binary case probabilities (N, 2)
+                    auc = roc_auc_score(all_y_np, all_y_hat_prob_np[:, 1], average='macro')
+                else: # Multi-class case probabilities (N, num_classes)
+                    try:
+                        auc = roc_auc_score(all_y_np, all_y_hat_prob_np, average='macro', multi_class='ovr')
+                    except ValueError as e:
+                        print(f"Warning: Could not compute AUC for task {target_task_name} (multi-class): {e}. Setting AUC to 0.0. Ensure labels are correctly encoded and present in predictions.")
+                        auc = 0.0
+            else:
+                print(f"Warning: AUC for task {target_task_name} could not be computed. Probability array shape issue: {all_y_hat_prob_np.shape}. Expected (n_samples, n_classes >= 2).")
+        else:
+            print(f"Warning: AUC for task {target_task_name} set to 0.0 as only one class present in true labels or labels are empty.")
     else:
-        auc = roc_auc_score(all_y, all_y_hat_prob, average='macro', multi_class='ovr')
+        print(f"Warning: AUC for task {target_task_name} set to 0.0 due to empty labels or probabilities after processing.")
+
     metrics = {
-        "acc": accuracy_score(all_y, all_y_hat),
+        "acc": acc,
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -140,7 +178,7 @@ def get_classification_metrics(model, dataloader, device, average='macro', detai
     }
     if not detailed:
         return metrics
-    return metrics, all_y, all_y_hat, all_y_hat_prob
+    return metrics, all_y_task, all_y_hat_task, all_y_hat_prob_task
 
 
 class AverageMeter(object):
@@ -264,66 +302,125 @@ def create_bag_masks(df, bag_size, bag_embedded_column_name):
 def preprocess_dataframe(
         df: pd.DataFrame,
         dataframe_set: str,
-        target_labels: list[str], # CHANGED: from label: str to target_labels: list[str]
-        train_dataframe_means: dict[str, Optional[float]], # CHANGED: to dict
-        train_dataframe_medians: dict[str, Optional[float]], # CHANGED: to dict
-        train_dataframe_stds: dict[str, Optional[float]], # CHANGED: to dict
-        task_type: str, # This might become a dict if tasks have different types, or assume classification for now
+        target_labels: List[str],
+        task_type: str,
+        fitted_label_encoders: Optional[Dict[str, LabelEncoder]] = None,
+        train_dataframe_medians: Optional[Dict[str, Optional[float]]] = None,
         extra_columns: Optional[List[str]] = [],
 ):
-    # Ensure essential columns are present
     required_cols = ["bag_embeddings", "bag", "bag_mask"] + target_labels + extra_columns
     for col in required_cols:
         if col not in df.columns:
-            raise ValueError(f"Missing required column: {col} in DataFrame")
+            raise ValueError(f"Missing required column: {col} in DataFrame for {dataframe_set} set.")
 
-    df_processed = df[required_cols].copy() # Work on a copy
-    df_processed = df_processed.dropna(subset=target_labels) # Drop rows if any of the target labels are NaN
-    df_processed = df_processed.reset_index(drop=True)
+    df_processed = df[required_cols].copy()
+    df_processed = df_processed.dropna(subset=target_labels).reset_index(drop=True)
 
-    print(f"Length of df_processed after dropna: {len(df_processed)}") # DEBUG
+    if df_processed.empty:
+        print(f"Warning: DataFrame for {dataframe_set} is empty after initial dropna on target labels: {target_labels}.")
+        # Prepare to return empty structures
+        empty_labels_dict_col = pd.Series([{} for _ in range(len(df_processed))], dtype=object)
+        df_processed["labels"] = empty_labels_dict_col
+        final_columns_empty = ["bag_embeddings", "bag", "bag_mask", "labels"] + extra_columns
+        df_final_empty = df_processed[final_columns_empty] # Ensure columns exist even if empty
 
+        if dataframe_set == "train":
+            return df_final_empty, {}, {}, {} # df, label2id, id2label, encoders
+        else:
+            return df_final_empty, {}, {} # df, label2id, id2label
+
+
+    # This will store encoders fitted on train data if dataframe_set is "train"
+    output_encoders = {} if dataframe_set == "train" else None # CHANGED: initialize for train
     all_label2id = {}
     all_id2label = {}
-
-    # Create a new dictionary to store processed labels
-    processed_labels_dict = {}
+    processed_labels_dict_for_df_col = {}
 
     for label_name in target_labels:
-        current_task_type = task_type # Assuming common task_type for now
-        # For mixed types: current_task_type = task_type.get(label_name, "classification")
+        current_task_type_for_label = task_type # Use common task_type
+        encoded_col_name = f"{label_name}_encoded"
 
+        if label_name in REGRESSION_LABELS and current_task_type_for_label == "classification":
+            if train_dataframe_medians is None or label_name not in train_dataframe_medians:
+                raise ValueError(f"Median for '{label_name}' must be provided from training data for binarization in {dataframe_set} set.")
+            median_val = train_dataframe_medians[label_name]
+            if pd.isna(median_val):
+                 raise ValueError(f"Median for '{label_name}' is NaN, cannot binarize for {dataframe_set} set.")
 
-        if current_task_type == "regression":
-            processed_labels_dict[label_name] = df_processed[label_name].astype(float)
-        else: # Classification
-            label_encoder = LabelEncoder()
-            encoded_col_name = f"{label_name}_encoded"
+            df_processed[encoded_col_name] = df_processed[label_name].apply(lambda x: 0 if pd.isna(x) else (0 if x < median_val else 1))
 
+            # For binarized labels, classes are [0, 1]
+            temp_encoder = LabelEncoder()
+            temp_encoder.classes_ = np.array(['0', '1']) # Consistent string representation
+            all_label2id[label_name] = {label: idx for idx, label in enumerate(temp_encoder.classes_)}
+            all_id2label[label_name] = {idx: label for idx, label in enumerate(temp_encoder.classes_)}
+            if dataframe_set == "train" and output_encoders is not None:
+                output_encoders[label_name] = temp_encoder # Store this effective encoder
+
+        elif current_task_type_for_label == "classification": # Standard classification
             if dataframe_set == "train":
+                label_encoder = LabelEncoder()
                 df_processed[encoded_col_name] = label_encoder.fit_transform(df_processed[label_name].astype(str))
-            else:
-                temp_encoder = LabelEncoder() # Placeholder
-                # This is a simplified approach.
-                unique_labels_in_split = df_processed[label_name].astype(str).unique()
-                temp_encoder.fit(unique_labels_in_split) # Fit on current split's unique labels
-                df_processed[encoded_col_name] = temp_encoder.transform(df_processed[label_name].astype(str))
-                label_encoder = temp_encoder
+                if output_encoders is not None:
+                    output_encoders[label_name] = label_encoder
+            else: # val or test
+                if fitted_label_encoders is None or label_name not in fitted_label_encoders:
+                    raise ValueError(f"Fitted LabelEncoder for task '{label_name}' must be provided for {dataframe_set} set.")
+                label_encoder = fitted_label_encoders[label_name]
+                current_labels_str = df_processed[label_name].astype(str)
+                # Create a mask for labels that are known to the encoder
+                known_labels_mask = current_labels_str.isin(label_encoder.classes_)
+                # Initialize encoded column with NaNs or a placeholder
+                df_processed[encoded_col_name] = pd.Series(np.nan, index=df_processed.index)
 
+                if known_labels_mask.any(): # If there are any known labels to transform
+                    df_processed.loc[known_labels_mask, encoded_col_name] = label_encoder.transform(current_labels_str[known_labels_mask])
+
+                if (~known_labels_mask).any():
+                    unknown_found = current_labels_str[~known_labels_mask].unique()
+                    print(f"Warning: {len(unknown_found)} unique unseen labels found in '{label_name}' for {dataframe_set} set (e.g., {list(unknown_found)[:5]}). Rows with these labels will have NaN for this task's encoded label.")
 
             all_label2id[label_name] = {label: idx for idx, label in enumerate(label_encoder.classes_)}
             all_id2label[label_name] = {idx: label for idx, label in enumerate(label_encoder.classes_)}
-            processed_labels_dict[label_name] = df_processed[encoded_col_name]
 
-    # Add the dictionary of processed labels as a new column 'labels_dict'
-    # Or RLMILDataset can be modified to take df_processed and extract columns by names later
-    df_processed["labels"] = [dict(zip(processed_labels_dict,t)) for t in zip(*processed_labels_dict.values())]
+        else: # Regression task
+             df_processed[encoded_col_name] = df_processed[label_name].astype(float)
+             # No label2id/id2label needed in the same way for regression
+             all_label2id[label_name] = {}
+             all_id2label[label_name] = {}
 
-    # Keep only essential columns plus the new 'labels' dict column
+        processed_labels_dict_for_df_col[label_name] = df_processed[encoded_col_name]
+
+    encoded_cols_to_check_for_na = [f"{lbl}_encoded" for lbl in target_labels if f"{lbl}_encoded" in df_processed.columns and task_type == "classification"] # Check only classification encoded cols
+    if encoded_cols_to_check_for_na:
+        df_processed.dropna(subset=encoded_cols_to_check_for_na, inplace=True)
+        df_processed = df_processed.reset_index(drop=True)
+
+    if df_processed.empty:
+        print(f"Warning: DataFrame for {dataframe_set} became empty after processing all labels and dropping NaNs from encoded columns.")
+        # Construct an empty 'labels' column structure
+        empty_labels_series = pd.Series([{} for _ in range(len(df_processed))], index=df_processed.index, dtype=object)
+        df_processed["labels"] = empty_labels_series
+    else:
+        # Create the 'labels' column as a dictionary of all processed labels
+        df_processed["labels"] = [dict(zip(processed_labels_dict_for_df_col, t)) for t in zip(*processed_labels_dict_for_df_col.values())]
+
+
     final_columns = ["bag_embeddings", "bag", "bag_mask", "labels"] + extra_columns
+    # Ensure all final columns are present
+    for col in final_columns:
+        if col not in df_processed.columns:
+            if col == "labels" and "labels" not in df_processed: # if 'labels' couldn't be made due to empty intermediate
+                 df_processed["labels"] = pd.Series([{} for _ in range(len(df_processed))], index=df_processed.index, dtype=object)
+            else:
+                raise ValueError(f"Final column '{col}' missing before final selection for {dataframe_set} set.")
+
     df_final = df_processed[final_columns].copy()
 
-    return df_final, all_label2id, all_id2label
+    if dataframe_set == "train":
+        return df_final, all_label2id, all_id2label, output_encoders
+    else:
+        return df_final, all_label2id, all_id2label
 
 
 def get_df_mean_median_std(df, label):
@@ -339,95 +436,116 @@ def get_df_mean_median_std(df, label):
 
 
 def create_preprocessed_dataframes(train_dataframe: pd.DataFrame, val_dataframe: pd.DataFrame,
-                                   test_dataframe: pd.DataFrame, target_labels: list[str], task_type: str,
+                                   test_dataframe: pd.DataFrame, target_labels: List[str], task_type: str, # task_type common for all
                                    extra_columns: Optional[List[str]] = []):
+
     train_dataframe_means = {}
     train_dataframe_medians = {}
     train_dataframe_stds = {}
 
+    # Calculate stats for regression labels OR labels to be binarized FROM TRAINING DATA ONLY
     for label_name in target_labels:
-        mean, median, std = get_df_mean_median_std(train_dataframe, label_name)
-        train_dataframe_means[label_name] = mean
-        train_dataframe_medians[label_name] = median
-        train_dataframe_stds[label_name] = std
+        if (label_name in REGRESSION_LABELS and task_type == "classification") or task_type == "regression":
+            mean, median, std = get_df_mean_median_std(train_dataframe, label_name)
+            if median is not None: # Median is crucial for binarization
+                train_dataframe_medians[label_name] = median
+            if mean is not None: # Store if available
+                train_dataframe_means[label_name] = mean
+                train_dataframe_stds[label_name] = std
 
-    train_dataframe_processed, label2id_map, id2label_map = preprocess_dataframe(
+    # Process training data: fit encoders and get mappings
+    train_dataframe_processed, train_label2id_map, train_id2label_map, fitted_encoders = preprocess_dataframe(
         df=train_dataframe, dataframe_set="train", target_labels=target_labels,
-        train_dataframe_means=train_dataframe_means,
-        train_dataframe_medians=train_dataframe_medians,
-        train_dataframe_stds=train_dataframe_stds,
-        task_type=task_type, # Adjust if task_type becomes a dict
+        task_type=task_type,
+        # fitted_label_encoders=None, # Not needed for train
+        train_dataframe_medians=train_dataframe_medians, # Pass medians for binarization
+        # train_dataframe_means=train_dataframe_means, # Not directly used in preprocess_dataframe currently
+        # train_dataframe_stds=train_dataframe_stds,   # Not directly used
         extra_columns=extra_columns
     )
 
+    # Process validation data: use fitted encoders and train stats
     val_dataframe_processed, _, _ = preprocess_dataframe(
         df=val_dataframe, dataframe_set="val", target_labels=target_labels,
-        train_dataframe_means=train_dataframe_means,
+        task_type=task_type,
+        fitted_label_encoders=fitted_encoders, # Pass the encoders from train
         train_dataframe_medians=train_dataframe_medians,
-        train_dataframe_stds=train_dataframe_stds,
-        task_type=task_type, # Adjust if task_type becomes a dict
         extra_columns=extra_columns
     )
 
+    # Process test data: use fitted encoders and train stats
     test_dataframe_processed, _, _ = preprocess_dataframe(
         df=test_dataframe, dataframe_set="test", target_labels=target_labels,
-        train_dataframe_means=train_dataframe_means,
+        task_type=task_type,
+        fitted_label_encoders=fitted_encoders, # Pass the encoders from train
         train_dataframe_medians=train_dataframe_medians,
-        train_dataframe_stds=train_dataframe_stds,
-        task_type=task_type, # Adjust if task_type becomes a dict
         extra_columns=extra_columns
     )
 
-    return train_dataframe_processed, val_dataframe_processed, test_dataframe_processed, label2id_map, id2label_map
+    return train_dataframe_processed, val_dataframe_processed, test_dataframe_processed, train_label2id_map, train_id2label_map
+
 
 
 class EarlyStopping:
-    def __init__(self, models_dir: str, save_model_name, trace_func, patience: int = 7, verbose: bool = False,
+    def __init__(self, models_dir: str, save_model_name: Optional[str], trace_func,
+                 patience: int = 7, verbose: bool = False,
                  delta: float = 0.0, descending: bool = True):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
-        self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
         self.delta = delta
         self.models_dir = models_dir
         self.trace_func = trace_func
         self.descending = descending
 
+        self.best_metric_value = -np.Inf if descending else np.Inf
+        self.best_epoch = -1
+
         if save_model_name:
             self.model_address = os.path.join(self.models_dir, save_model_name)
-
-    def __call__(self, val_loss, model):
-        if self.descending:
-            score = -val_loss
         else:
-            score = val_loss
+            self.model_address = None # Handle cases where no model saving is needed
 
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model)
-        elif score <= self.best_score + self.delta:
+    def __call__(self, current_metric_value, model, epoch: Optional[int] = None):
+        improved = False
+        if self.descending: # Higher is better
+            if current_metric_value > self.best_metric_value + self.delta:
+                improved = True
+        else: # Lower is better (ascending)
+            if current_metric_value < self.best_metric_value - self.delta:
+                improved = True
+
+        if improved:
+            if self.verbose:
+                old_best_for_log = "N/A" if (self.best_metric_value == -np.Inf or self.best_metric_value == np.Inf) else f"{self.best_metric_value:.6f}"
+                self.trace_func(
+                    f"EarlyStopping: Metric improved from {old_best_for_log} to {current_metric_value:.6f}."
+                )
+            self.best_metric_value = current_metric_value
+            if epoch is not None:
+                self.best_epoch = epoch
+            self.save_checkpoint(model)
+            self.counter = 0
+        else:
             self.counter += 1
-            self.trace_func(
-                f"EarlyStopping counter: {self.counter} out of {self.patience}"
-            )
+            if self.verbose: # Optional: log even when not improving
+                self.trace_func(
+                    f"EarlyStopping counter: {self.counter} out of {self.patience} (Best: {self.best_metric_value:.6f} at epoch {self.best_epoch})"
+                )
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model)
-            self.counter = 0
+                if self.verbose:
+                    self.trace_func(f"EarlyStopping: Stopping training. Best metric {self.best_metric_value:.6f} at epoch {self.best_epoch}.")
 
-    def save_checkpoint(self, val_loss, model):
-        """Saves model when validation loss decrease."""
-        if self.verbose:
-            self.trace_func(
-                f"Score changed ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ..."
-            )
-        self.val_loss_min = val_loss
+    def save_checkpoint(self, model):
+        """Saves model when the monitored metric improves."""
         if self.model_address:
+            if self.verbose:
+                self.trace_func(f"EarlyStopping: Saving model to {self.model_address} (Metric: {self.best_metric_value:.6f})")
             torch.save(model.state_dict(), self.model_address)
+        elif self.verbose:
+            self.trace_func("EarlyStopping: Improvement detected, but no model_address provided for saving.")
 
 
 def get_model(model_path: str, ensemble: bool = False):
@@ -441,36 +559,54 @@ def get_model(model_path: str, ensemble: bool = False):
     else:
         model_path = os.path.join(model_path, "best_model.pt")
         model_state_dict = torch.load(model_path, map_location=torch.device("cpu"))
-    model_name = model_path.split("/")[-2]
-    baseline = model_name.split("_")[0]
-    autoencoder_layers = list(map(int, model_name.split("_")[1:]))
-    if "MLP" in model_name:
-        args = Namespace(
-            **{
-                "dropout_p": 0.5,
-                "input_dim": model_state_dict["mlp.0.weight"].size()[1],
-                "hidden_dim": model_state_dict["mlp.0.weight"].size()[0],
-                "number_of_classes": model_state_dict["mlp.3.bias"].size()[0],
-                "autoencoder_layer_sizes": autoencoder_layers,
-                "baseline": baseline,
-            }
-        )
-    else:
-        args = Namespace(
-            **{
-                "input_dim": autoencoder_layers[-1],
-                "dropout_p": 0.5,
-                "n_hidden_sets": model_state_dict["fc1.weight"].size()[1],
-                "n_elements": model_state_dict["Wc"].size()[1] // model_state_dict["fc1.weight"].size()[1],
-                "number_of_classes": model_state_dict["fc2.bias"].size()[0],
-                "autoencoder_layer_sizes": autoencoder_layers,
-                "baseline": baseline,
-            }
-        )
 
-    model = create_mil_model(args)
-    model.load_state_dict(model_state_dict)
-    return model, args
+    config_file_path = os.path.join(os.path.dirname(model_path), "best_model_config.json")
+    if not os.path.exists(config_file_path) and not ensemble: # For RL models, config might be one level up
+        config_file_path_alt = os.path.join(os.path.dirname(os.path.dirname(model_path)), "best_model_config.json")
+        if os.path.exists(config_file_path_alt):
+            config_file_path = config_file_path_alt
+
+    if os.path.exists(config_file_path):
+        config = load_json(config_file_path)
+        args_ns = Namespace(**config)
+        if "number_of_classes" in config and "output_dims_dict" not in config and isinstance(config.get("label"), list):
+            print("Warning: Loaded single-task config 'number_of_classes', but multiple labels suggest MTL. Ensure 'output_dims_dict' is correctly set in config or args for create_mil_model.")
+        print(f"Warning: best_model_config.json not found at {config_file_path}. Inferring model args from path and state_dict (may be inaccurate for MTL).")
+        model_name_from_path = os.path.basename(os.path.dirname(model_path)) # e.g., MeanMLP_768_256_768 or a prefix folder for RL
+        if ensemble or "sweep_best_rl_model" in model_path : # if it's an RL model, path is deeper
+             model_name_from_path = os.path.basename(os.path.dirname(os.path.dirname(model_path)))
+
+        baseline = model_name_from_path.split("_")[0]
+        autoencoder_layers_str = model_name_from_path.split("_")[1:]
+        autoencoder_layers = [int(x) for x in autoencoder_layers_str if x.isdigit()] if any(s.isdigit() for s in autoencoder_layers_str) else None
+
+        output_dims_dict_inferred = {}
+        for key in model_state_dict.keys():
+            if "task_heads" in key and "3.bias" in key: # Example key structure
+                task_name = key.split('.')[1]
+                output_dims_dict_inferred[task_name] = model_state_dict[key].size(0)
+
+        if not output_dims_dict_inferred: # Fallback if no task_heads found
+            num_classes_fallback = model_state_dict.get("mlp.3.bias", model_state_dict.get("fc2.bias", torch.tensor([1]))).size(0) # default to 1 if not found
+            output_dims_dict_inferred = {"default_task": num_classes_fallback}
+
+        args_dict_fallback = {
+            "baseline": baseline,
+            "autoencoder_layer_sizes": autoencoder_layers,
+            "dropout_p": 0.5, # default
+            "input_dim": model_state_dict.get(f"{baseline.lower() if 'MLP' in baseline else 'base_network.net'}.0.weight", next(iter(model_state_dict.values()))).size(1),
+            "hidden_dim": model_state_dict.get(f"{baseline.lower() if 'MLP' in baseline else 'task_heads.placeholder'}.0.weight", next(iter(model_state_dict.values()))).size(0), # Placeholder
+            "output_dims_dict": output_dims_dict_inferred # This is crucial for MTL
+        }
+        if "repset" in baseline and "fc1.weight" in model_state_dict:
+            args_dict_fallback["n_hidden_sets"] = model_state_dict["fc1.weight"].size()[1]
+            args_dict_fallback["n_elements"] = model_state_dict["Wc"].size()[1] // model_state_dict["fc1.weight"].size()[1]
+
+        args_ns = Namespace(**args_dict_fallback)
+
+    model = create_mil_model(args_ns) # create_mil_model MUST handle args_ns.output_dims_dict
+    model.load_state_dict(model_state_dict, strict=False) # Use strict=False if some keys might not match (e.g. old single task to new MTL)
+    return model, args_ns
 
 def get_balanced_weights(labels):
     label_set = list(set(labels))
