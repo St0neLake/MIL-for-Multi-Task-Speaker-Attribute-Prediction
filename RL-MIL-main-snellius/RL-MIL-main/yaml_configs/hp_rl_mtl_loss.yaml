@@ -1,0 +1,48 @@
+method: bayes # or grid, random
+metric:
+  goal: maximize
+  name: eval/avg_COMBINED_REWARD # Or eval/ensemble_COMBINED_REWARD
+parameters:
+  epochs:
+    distribution: constant
+    value: 100 # Max epochs per trial, early stopping will likely trigger
+  warmup_epochs: # If you want to sweep this
+    distribution: categorical
+    values:
+      - 0
+      - 5
+      - 10
+  actor_learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 1.0e-03
+  critic_learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 1.0e-03
+  learning_rate: # For the base MIL model fine-tuning
+    distribution: log_uniform_values
+    min: 1.0e-06
+    max: 1.0e-04
+  hdim: # For PolicyNetwork actor/critic hidden layers
+    distribution: categorical
+    values:
+      - 32
+      - 64
+      - 128
+  epsilon: # For epsilon-greedy search_algorithm
+    distribution: uniform
+    min: 0.05
+    max: 0.3
+  reg_coef: # For policy regularization
+    distribution: uniform
+    min: 0.0
+    max: 0.1
+  # These are usually fixed by run_rlmil.sh but could be swept if needed
+  # batch_size:
+  #   distribution: constant
+  #   value: 32 # Or sweep it: values: [32, 64]
+  # early_stopping_patience:
+  #   distribution: constant
+  #   value: 10 # Or sweep it
+run_cap: 50

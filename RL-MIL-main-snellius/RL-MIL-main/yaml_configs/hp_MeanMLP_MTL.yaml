@@ -1,0 +1,38 @@
+method: bayes
+metric:
+  goal: maximize # Or minimize if using a combined loss
+  name: eval/avg_F1 # CHANGED: Example: Average F1 across tasks. Ensure run_mil.py logs this.
+                   # If run_mil.py logs individual F1s (e.g. eval/age_f1, eval/gender_f1),
+                   # you might need a custom script to calculate and log eval/avg_F1,
+                   # or W&B might allow defining a metric based on others.
+                   # Alternatively, stick to minimizing a combined 'eval/loss'.
+parameters:
+  batch_size:
+    distribution: categorical
+    values:
+    - 64 # Increased from original MeanMLP example due to larger dataset
+    - 128
+  dropout_p:
+    distribution: constant
+    value: 0.5
+  epochs:
+    distribution: int_uniform
+    max: 200 # Adjusted from original MeanMLP example
+    min: 50
+  hidden_dim: # This would be for the task heads in MTL MeanMLP
+    distribution: categorical
+    values:
+    - 64
+    - 128
+    - 256
+  learning_rate:
+    distribution: log_uniform_values
+    max: 1.0e-3 # Adjusted range
+    min: 1.0e-5
+  scheduler_patience:
+    distribution: constant
+    value: 5
+  early_stopping_patience:
+    distribution: constant
+    value: 10 # Standard MIL patience
+run_cap: 30 # Number of sweep runs

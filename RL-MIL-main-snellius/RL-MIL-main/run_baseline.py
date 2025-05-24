@@ -13,7 +13,7 @@ from utils import (
     AverageMeter,
     EarlyStopping,
     get_classification_metrics,
-    get_crossentropy, get_mse,  get_r2_score, 
+    get_crossentropy, get_mse,  get_r2_score,
     get_data_directory,
     get_model_save_directory,
     get_model_name,
@@ -175,10 +175,10 @@ def classification():
                 path=os.path.join(run_dir, "best_model_config.json"),
                 data=best_model_config,
             )
-            
+
             test_loss = get_crossentropy(model, test_dataloader, DEVICE)
             test_classification_metrics = get_classification_metrics(model, test_dataloader, DEVICE)
-            
+
             dictionary = {
                 "model": args.baseline,
                 "embedding_model": args.embedding_model,
@@ -211,6 +211,7 @@ def classification():
         model, test_dataloader, DEVICE
     )
     if not args.no_wandb or args.run_sweep:
+        print(test_classification_metrics)
         wandb.log(
             {
                 "test/loss": test_loss,
@@ -304,9 +305,9 @@ def regression():
         val_loss = get_mse(model, val_dataloader, DEVICE)
 
         scheduler.step(val_loss)
-        train_r2 = get_r2_score(model=model, dataloader=train_dataloader, device=DEVICE, 
+        train_r2 = get_r2_score(model=model, dataloader=train_dataloader, device=DEVICE,
                                 min_clip=args.min_clip, max_clip=args.max_clip)
-        val_r2 = get_r2_score(model=model, dataloader=val_dataloader, device=DEVICE, 
+        val_r2 = get_r2_score(model=model, dataloader=val_dataloader, device=DEVICE,
                               min_clip=args.min_clip, max_clip=args.max_clip)
 
         if not args.no_wandb or args.run_sweep:
@@ -358,10 +359,10 @@ def regression():
                 path=os.path.join(run_dir, "best_model_config.json"),
                 data=best_model_config,
             )
-            
+
             test_loss = get_mse(model, test_dataloader, DEVICE)
             test_r2 = get_r2_score(model=model, dataloader=test_dataloader, device=DEVICE, min_clip=args.min_clip, max_clip=args.max_clip)
-            
+
             dictionary = {
                 "model": args.baseline,
                 "embedding_model": args.embedding_model,
@@ -410,7 +411,7 @@ if __name__ == "__main__":
                                        data_embedded_column_name=args.data_embedded_column_name,
                                        embedding_model_name=args.embedding_model, target_column_name=args.label,
                                        bag_size=args.bag_size, baseline=args.baseline,
-                                       autoencoder_layers=args.autoencoder_layer_sizes, random_seed=args.random_seed, 
+                                       autoencoder_layers=args.autoencoder_layer_sizes, random_seed=args.random_seed,
                                        dev=args.dev, task_type=args.task_type, prefix=None, multiple_runs=args.multiple_runs)
     logger = get_logger(run_dir)
     logger.info(f"{args=}")
@@ -504,7 +505,7 @@ if __name__ == "__main__":
     if args.task_type == 'regression':
         args.min_clip = float(train_dataset.Y.min())
         args.max_clip = float(train_dataset.Y.max())
-        
+
     torch.cuda.empty_cache()
     if args.run_sweep:
         # assert args.sweep_config is a dict

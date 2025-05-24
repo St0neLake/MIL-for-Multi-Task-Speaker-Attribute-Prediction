@@ -19,7 +19,7 @@ class RLMILDataset(Dataset):
         self.bag = df["bag"]
         self.bag_true_mask = df["bag_mask"]
         self.bag_masks = bag_masks
-        self.task_type = task_type
+        self.task_type_global = task_type
         self.subset = subset
         if instance_labels_column is not None:
             self.instance_labels = df[instance_labels_column]
@@ -34,13 +34,23 @@ class RLMILDataset(Dataset):
         self.subset = subset
 
     def get_y(self, index: int):
-        if self.task_type == "regression":
-            return torch.tensor(self.Y[index]).float()
-        elif self.task_type == "classification":
-            return torch.tensor(self.Y[index]).long()
+        labels_dict_for_sample = self.Y.iloc[index]
+        tensor_dict = {}
+        for task_name, label_value in labels_dict_for_sample.items():
+            # Assuming all tasks are classification for 'age', 'gender', 'party'
+            # If task_type were a dict: current_task_type = self.task_type.get(task_name, "classification")
+            current_task_type = self.task_type_global
+
+            if current_task_type == "regression":
+                tensor_dict[task_name] = torch.tensor(label_value).float()
+            elif current_task_type == "classification":
+                tensor_dict[task_name] = torch.tensor(label_value).long()
+            else:
+                raise ValueError(f"Unsupported task_type: {current_task_type} for task {task_name}")
+        return tensor_dict
 
     def get_x(self, index: int):
-        x = torch.tensor(self.X[index]).float()
+        x = torch.tensor(self.X.iloc[index]).float()
         if self.subset:
             mask = self.bag_masks[index]
             return x[mask, :]

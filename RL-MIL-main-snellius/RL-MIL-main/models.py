@@ -34,10 +34,7 @@ class BaseNetwork(nn.Module):
 
     def forward(self, x):
         if self.layer_sizes:
-            # batch_size, bag_size, d = x.size()
-            # x = x.view(batch_size * bag_size, d)
             x = self.net(x)
-            # x = x.view(batch_size, bag_size, -1)
         return x
 
 
@@ -73,31 +70,34 @@ class SimpleMLP(nn.Module, ABC):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(x)  # Apply the MLP
         return x
-    
+
 class BaseMLP(nn.Module, ABC):
     def __init__(
             self,
             input_dim: int,
             hidden_dim: int,
-            output_dim: int,
+            output_dims_dict: dict[str, int],
             dropout_p: float = 0.5,
             autoencoder_layer_sizes=None,
     ):
         super(BaseMLP, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.dropout_p = dropout_p  # register the droupout probability as a buffer
+        self.input_dim_for_aggregation = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
+        self.hidden_dim_for_heads = hidden_dim
+        self.output_dims_dict = output_dims_dict
+        self.dropout_p = dropout_p
 
         self.autoencoder_layer_sizes = autoencoder_layer_sizes
-        self.base_network = BaseNetwork(self.autoencoder_layer_sizes)
+        self.base_network = BaseNetwork(self.autoencoder_layer_sizes) # Processes instance embeddings
 
-        self.mlp = nn.Sequential(
-            nn.Linear(self.input_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(p=self.dropout_p),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
+        self.task_heads = nn.ModuleDict()
+        # The input to these heads is the result of self.aggregate(), which should have self.input_dim_for_aggregation dimension
+        for task_name, num_classes_for_task in self.output_dims_dict.items():
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(self.input_dim_for_aggregation, self.hidden_dim_for_heads),
+                nn.ReLU(),
+                nn.Dropout(p=self.dropout_p),
+                nn.Linear(self.hidden_dim_for_heads, num_classes_for_task),
+            )
 
         self.initialize_weights()
 
@@ -105,19 +105,23 @@ class BaseMLP(nn.Module, ABC):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.base_network(x)
-        x = self.aggregate(x)  # Aggregate the data
-        x = self.mlp(x)  # Apply the MLP
-        return x
+        aggregated_x = self.aggregate(x)
+
+        outputs = {}
+        for task_name, head in self.task_heads.items():
+            outputs[task_name] = head(aggregated_x)
+        return outputs
 
     def get_aggregated_data(self, x: torch.Tensor) -> torch.Tensor:
         x = self.base_network(x)
         x = self.aggregate(x)
         return x
-    
+
     @abstractmethod
     def aggregate(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -134,14 +138,15 @@ class MeanMLP(BaseMLP):
             self,
             input_dim,
             hidden_dim,
-            output_dim,
+            output_dims_dict: dict[str, int],
             dropout_p: float = 0.5,
             autoencoder_layer_sizes=None,
     ):
+        dim_after_autoencoder = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
         super(MeanMLP, self).__init__(
-            input_dim,
+            dim_after_autoencoder,
             hidden_dim,
-            output_dim,
+            output_dims_dict,
             dropout_p,
             autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
@@ -155,14 +160,15 @@ class MaxMLP(BaseMLP):
             self,
             input_dim,
             hidden_dim,
-            output_dim,
+            output_dims_dict: dict[str, int],
             dropout_p: float = 0.5,
             autoencoder_layer_sizes=None,
     ):
+        dim_after_autoencoder = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
         super(MaxMLP, self).__init__(
-            input_dim,
+            dim_after_autoencoder,
             hidden_dim,
-            output_dim,
+            output_dims_dict,
             dropout_p,
             autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
@@ -178,43 +184,52 @@ class AttentionMLP(BaseMLP):
             self,
             input_dim,
             hidden_dim,
-            output_dim,
+            output_dims_dict: dict[str, int],
             dropout_p: float = 0.5,
             is_linear_attention: bool = True,
             attention_size: int = 64,
             attention_dropout_p: float = 0.5,
             autoencoder_layer_sizes=None,
     ):
+        dim_after_autoencoder = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
+        self.attention_input_dim = dim_after_autoencoder # Dimension for the attention mechanism input
         super(AttentionMLP, self).__init__(
-            input_dim,
+            dim_after_autoencoder,
             hidden_dim,
-            output_dim,
+            output_dims_dict,
             dropout_p,
             autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
-        self.attention = None
+        # self.attention = None
         self.is_linear_attention = is_linear_attention
         self.attention_size = attention_size
         self.attention_dropout_p = attention_dropout_p
 
         self.init_attention()
-        self.initialize_weights()
+        # self.initialize_weights()
 
     def init_attention(self):
         if self.is_linear_attention:
-            self.attention = nn.Linear(self.input_dim, 1)
+            self.attention_mechanism = nn.Linear(self.attention_input_dim, 1)
         else:
-            self.attention = torch.nn.Sequential(
-                torch.nn.Linear(self.input_dim, self.attention_size),
+            self.attention_mechanism = torch.nn.Sequential(
+                torch.nn.Linear(self.attention_input_dim, self.attention_size),
                 torch.nn.Dropout(p=self.attention_dropout_p),
                 torch.nn.Tanh(),
                 torch.nn.Linear(self.attention_size, 1),
             )
 
+        # Ensure these new layers are also initialized
+        for m in self.attention_mechanism.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def aggregate(self, x):
-        attention = self.attention(x)
-        attention = F.softmax(attention, dim=1)
-        return torch.sum(x * attention, dim=1)
+        attention_weights = self.attention_mechanism(x)
+        attention_weights = F.softmax(attention_weights, dim=1)
+        return torch.sum(x * attention_weights, dim=1)
 
 
 class ApproxRepSet(nn.Module):
@@ -223,7 +238,7 @@ class ApproxRepSet(nn.Module):
             input_dim,
             n_hidden_sets,
             n_elements,
-            n_classes,
+            output_dims_dict: dict[str, int],
             autoencoder_layer_sizes=None,
     ):
         super(ApproxRepSet, self).__init__()
@@ -231,34 +246,44 @@ class ApproxRepSet(nn.Module):
         self.n_elements = n_elements
 
         self.autoencoder_layer_sizes = autoencoder_layer_sizes
+        dim_after_autoencoder = autoencoder_layer_sizes[-1] if autoencoder_layer_sizes else input_dim
         self.base_network = BaseNetwork(self.autoencoder_layer_sizes)
 
-        self.Wc = nn.Parameter(torch.FloatTensor(input_dim, n_hidden_sets * n_elements))
+        # Wc operates on the output of the autoencoder
+        self.Wc = nn.Parameter(torch.FloatTensor(dim_after_autoencoder, n_hidden_sets * n_elements))
 
-        self.fc1 = nn.Linear(n_hidden_sets, 32)
-        self.fc2 = nn.Linear(32, n_classes)
+        self.fc1 = nn.Linear(n_hidden_sets, 32) # This layer's output (32) is input to task heads
         self.relu = nn.ReLU()
+
+        self.task_heads = nn.ModuleDict()
+        for task_name, num_classes in output_dims_dict.items():
+            self.task_heads[task_name] = nn.Linear(32, num_classes) # Input is 32 from self.fc1
 
         self.init_weights()
 
     def init_weights(self):
         nn.init.xavier_uniform_(self.Wc.data)
         nn.init.xavier_uniform_(self.fc1.weight.data)
-        nn.init.xavier_uniform_(self.fc2.weight.data)
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias.data)
 
-    def forward(self, x):  # x: (batch_size, bag_size, d)
-        t = self.base_network(x)  # t: (batch_size, bag_size, d)
-        t = self.relu(
-            torch.matmul(t, self.Wc)
-        )  # t: (batch_size, bag_size, n_hidden_sets * n_elements)
-        t = t.view(
-            t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets
-        )  # t: (batch_size, bag_size, n_elements, n_hidden_sets)
-        t, _ = torch.max(t, dim=2)  # t: (batch_size, bag_size, n_hidden_sets)
-        t = torch.sum(t, dim=1)  # t: (batch_size, n_hidden_sets)
-        t = self.relu(self.fc1(t))  # t: (batch_size, 32)
-        out = self.fc2(t)  # t: (batch_size, n_classes)
-        return out
+        for task_name in self.task_heads:
+            nn.init.xavier_uniform_(self.task_heads[task_name].weight.data)
+            if self.task_heads[task_name].bias is not None:
+                 nn.init.zeros_(self.task_heads[task_name].bias.data)
+
+    def forward(self, x):
+        t = self.base_network(x)
+        t = self.relu(torch.matmul(t, self.Wc))
+        t = t.view(t.size()[0], t.size()[1], self.n_elements, self.n_hidden_sets)
+        t, _ = torch.max(t, dim=2)
+        t = torch.sum(t, dim=1)
+        t = self.relu(self.fc1(t))
+
+        outputs = {}
+        for task_name, head in self.task_heads.items():
+            outputs[task_name] = head(t)
+        return outputs
 
 
 class StratifiedRandomBaseline:
@@ -393,114 +418,176 @@ def majority_model(train_dataframe, test_dataframe, args, logger):
     # Log the confusion matrix
     logger.info(f"Confusion matrix:\n{cm}")
 
-def create_mil_model(args):
+def create_mil_model(args): # args is expected to be a Namespace or dict-like object
+    if not hasattr(args, 'output_dims_dict') or not args.output_dims_dict:
+        if hasattr(args, 'number_of_classes') and hasattr(args, 'label') and isinstance(args.label, str):
+            # Fallback for single-task like configuration if needed for some legacy calls
+            print("Warning (create_mil_model): 'output_dims_dict' not found in args. Assuming single-task setup based on 'number_of_classes' and 'label'.")
+            output_dims_dict = {args.label: args.number_of_classes}
+        else:
+            raise ValueError("'output_dims_dict' is required in args for create_mil_model in MTL setup.")
+    else:
+        output_dims_dict = args.output_dims_dict
+
+    if not hasattr(args, 'input_dim') or args.input_dim is None:
+        raise ValueError("'input_dim' must be set in args for create_mil_model.")
+    mil_input_dim = args.input_dim # Use args.input_dim
+
+    # Ensure other necessary args are present, providing defaults if they might be missing from sweep config
+    hidden_dim = getattr(args, 'hidden_dim', 64) # Example default
+    dropout_p = getattr(args, 'dropout_p', 0.5)   # Example default
+    autoencoder_layer_sizes = getattr(args, 'autoencoder_layer_sizes', None)
+    n_hidden_sets = getattr(args, 'n_hidden_sets', None) # Specific to repset
+    n_elements = getattr(args, 'n_elements', None)       # Specific to repset
+    is_linear_attention = getattr(args, 'is_linear_attention', True) # Specific to AttentionMLP
+    attention_size = getattr(args, 'attention_size', 64)             # Specific to AttentionMLP
+
+
     if args.baseline == "MaxMLP":
         model = MaxMLP(
-            input_dim=args.input_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.number_of_classes,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif args.baseline == "MeanMLP":
         model = MeanMLP(
-            input_dim=args.input_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.number_of_classes,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
     elif args.baseline == "AttentionMLP":
         model = AttentionMLP(
-            input_dim=args.input_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.number_of_classes,
-            dropout_p=args.dropout_p,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+            is_linear_attention=is_linear_attention,
+            attention_size=attention_size
         )
     elif args.baseline == "repset":
+        if n_hidden_sets is None or n_elements is None:
+            raise ValueError("'n_hidden_sets' and 'n_elements' are required for repset baseline.")
         model = ApproxRepSet(
-            input_dim=args.input_dim,
-            n_hidden_sets=args.n_hidden_sets,
-            n_elements=args.n_elements,
-            n_classes=args.number_of_classes,
-            autoencoder_layer_sizes=args.autoencoder_layer_sizes,
+            input_dim=mil_input_dim,
+            n_hidden_sets=n_hidden_sets,
+            n_elements=n_elements,
+            output_dims_dict=output_dims_dict,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+        )
+    elif args.baseline == "SimpleMLP": # This is likely for non-MIL baseline comparison
+        if not output_dims_dict:
+             raise ValueError("output_dims_dict cannot be empty for SimpleMLP in MTL context.")
+        first_task_output_dim = next(iter(output_dims_dict.values()))
+        model = SimpleMLP(
+            input_dim=mil_input_dim, # SimpleMLP typically takes aggregated/mean features
+            hidden_dim=hidden_dim,
+            output_dim=first_task_output_dim,
+            dropout_p=dropout_p
         )
     else:
-        model = None
+        raise ValueError(f"Unsupported baseline: {args.baseline} in create_mil_model")
     return model
 
 
-def create_mil_model_with_dict(args):
-    if args['baseline'] == "MaxMLP":
+def create_mil_model_with_dict(config: dict): # config is a dictionary
+    if 'output_dims_dict' not in config or not config['output_dims_dict']:
+        if 'number_of_classes' in config and 'label' in config and isinstance(config['label'], str):
+            print("Warning (create_mil_model_with_dict): 'output_dims_dict' not found. Assuming single-task from 'number_of_classes'.")
+            output_dims_dict = {config['label']: config['number_of_classes']}
+        else:
+            raise ValueError("'output_dims_dict' is required in config for create_mil_model_with_dict for MTL.")
+    else:
+        output_dims_dict = config['output_dims_dict']
+
+    if 'input_dim' not in config or config['input_dim'] is None:
+        raise ValueError("'input_dim' must be set in config for create_mil_model_with_dict.")
+    mil_input_dim = config["input_dim"]
+
+    # Ensure other necessary config keys are present with defaults
+    hidden_dim = config.get('hidden_dim', 64)
+    dropout_p = config.get('dropout_p', 0.5)
+    autoencoder_layer_sizes = config.get("autoencoder_layer_sizes")
+    n_hidden_sets = config.get('n_hidden_sets') # Specific to repset
+    n_elements = config.get('n_elements')       # Specific to repset
+    is_linear_attention = config.get('is_linear_attention', True) # Specific to AttentionMLP
+    attention_size = config.get('attention_size', 64)             # Specific to AttentionMLP
+
+
+    if config['baseline'] == "MaxMLP":
         model = MaxMLP(
-            input_dim=args["input_dim"],
-            hidden_dim=args["hidden_dim"],
-            output_dim=args["number_of_classes"],
-            dropout_p=args["dropout_p"],
-            autoencoder_layer_sizes=args["autoencoder_layer_sizes"],
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
-    elif args['baseline'] == "MeanMLP":
+    elif config['baseline'] == "MeanMLP":
         model = MeanMLP(
-            input_dim=args["input_dim"],
-            hidden_dim=args["hidden_dim"],
-            output_dim=args["number_of_classes"],
-            dropout_p=args["dropout_p"],
-            autoencoder_layer_sizes=args["autoencoder_layer_sizes"],
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
-    elif args['baseline'] == "AttentionMLP":
+    elif config['baseline'] == "AttentionMLP":
         model = AttentionMLP(
-            input_dim=args["input_dim"],
-            hidden_dim=args["hidden_dim"],
-            output_dim=args["number_of_classes"],
-            dropout_p=args["dropout_p"],
-            autoencoder_layer_sizes=args["autoencoder_layer_sizes"],
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
+            is_linear_attention=is_linear_attention,
+            attention_size=attention_size
         )
-    elif args['baseline'] == "repset":
+    elif config['baseline'] == "repset":
+        if n_hidden_sets is None or n_elements is None:
+            raise ValueError("'n_hidden_sets' and 'n_elements' are required for repset baseline in config.")
         model = ApproxRepSet(
-            input_dim=args["input_dim"],
-            n_hidden_sets=args["n_hidden_sets"],
-            n_elements=args["n_elements"],
-            n_classes=args["number_of_classes"],
-            autoencoder_layer_sizes=args["autoencoder_layer_sizes"],
+            input_dim=mil_input_dim,
+            n_hidden_sets=n_hidden_sets,
+            n_elements=n_elements,
+            output_dims_dict=output_dims_dict,
+            autoencoder_layer_sizes=autoencoder_layer_sizes,
         )
-    elif args['baseline'] == "SimpleMLP":
-        model = MaxMLP(
-            input_dim=args["input_dim"],
-            hidden_dim=args["hidden_dim"],
-            output_dim=args["number_of_classes"],
-            dropout_p=args["dropout_p"],
+    elif config['baseline'] == "SimpleMLP":
+        if not output_dims_dict:
+             raise ValueError("output_dims_dict cannot be empty for SimpleMLP in MTL context in config.")
+        first_task_output_dim = next(iter(output_dims_dict.values()))
+        model = SimpleMLP(
+            input_dim=mil_input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=first_task_output_dim,
+            dropout_p=dropout_p,
         )
     else:
-        model = None
+        raise ValueError(f"Unsupported baseline: {config['baseline']} in create_mil_model_with_dict")
     return model
-
 
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
-            
+
 class ActorNetwork(nn.Module):
     def __init__(self, **kwargs):
         super(ActorNetwork, self).__init__()
-        # self.args = args
         self.state_dim = kwargs['state_dim']
-        # self.actor = nn.Linear(self.state_dim, 2)
         self.actor  = nn.Sequential(
             nn.Linear(self.state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 32),
             nn.ReLU(),
-            # nn.Linear(32, 2),
             nn.Linear(32, 1),
         )
         self.actor.apply(init_weights)
-        # nn.init.xavier_uniform_(self.actor.weight)
-        
+
     def forward(self, x):
-        # action_probs = F.softmax(self.actor(x), dim=-1)
         action_probs = F.sigmoid(self.actor(x))
         return action_probs
 
@@ -548,13 +635,13 @@ def sample_action(action_probs, n, device, random=False, algorithm="with_replace
         NotImplementedError
 
 def sample_action_with_replacement(action_probs, n, device, random=False):
-    # with replacement  
-    m = Categorical(action_probs)  
+    # with replacement
+    m = Categorical(action_probs)
     if random:
         action = torch.randint(0, action_probs.shape[1], (n, action_probs.shape[0])).to(device)
     else:
         action = m.sample((n,))
-    
+
     log_prob = m.log_prob(action).sum(dim=0)
     # from IPython import embed; embed(); exit()
     return action.T, log_prob
@@ -566,7 +653,7 @@ def sample_action_without_replacement(action_probs, n, device, random=False):
     if random:
         action = torch.empty((action_probs.shape[0], n), dtype=torch.long)
         for i in range(action_probs.shape[0]):
-            action[i] = torch.randperm(action_probs.shape[1])[:n]  
+            action[i] = torch.randperm(action_probs.shape[1])[:n]
         action = action.to(device)
     else:
         action = torch.multinomial(sample_weights, n)
@@ -580,7 +667,7 @@ def sample_static_action(action_probs, n, device, random=False):
     if random:
         action = torch.empty((action_probs.shape[0], n), dtype=torch.long)
         for i in range(action_probs.shape[0]):
-            action[i] = torch.randperm(action_probs.shape[1])[:n]  
+            action[i] = torch.randperm(action_probs.shape[1])[:n]
         action = action.to(device)
         log_prob = torch.gather(action_probs, 1, action)
     else:
@@ -604,17 +691,29 @@ class PolicyNetwork(nn.Module):
         self.task_model = kwargs['task_model']
         self.learning_rate = kwargs['learning_rate']
         self.device = kwargs['device']
-        self.task_type = kwargs['task_type']
+        self.task_type_global = kwargs['task_type']
         self.min_clip = kwargs['min_clip']
         self.max_clip = kwargs['max_clip']
+        kwarg_epsilon = kwargs.get('epsilon') # Get epsilon from kwargs
+        if kwarg_epsilon is not None and isinstance(kwarg_epsilon, (int, float)):
+            self.epsilon = float(kwarg_epsilon)
+        else:
+            print(f"PolicyNetwork __init__: Epsilon from kwargs was '{kwarg_epsilon}' (type: {type(kwarg_epsilon)}). Defaulting self.epsilon to 0.1")
+            self.epsilon = 0.1
         self.sample_algorithm = kwargs.get('sample_algorithm', 'with_replacement')
         self.no_autoencoder = kwargs.get('no_autoencoder', False)
-        
+
+        # Loss functions per task
+        self.task_names = list(self.task_model.task_heads.keys())
+        self.loss_fns = nn.ModuleDict({
+            task_name: get_loss_fn(self.task_type_global) # Assuming task_type_global applies to all
+            for task_name in self.task_names
+        })
+
         try:
             self.task_optim = optim.AdamW(self.task_model.parameters(), lr=self.learning_rate)
         except:
             self.task_optim = None
-        self.loss_fn = get_loss_fn(self.task_type)
 
         self.saved_actions = []
         self.rewards = []
@@ -624,21 +723,18 @@ class PolicyNetwork(nn.Module):
             batch_rep = batch_x
         else:
             batch_rep = self.task_model.base_network(batch_x).detach()
-        
-        # batch_size, bag_size, embedding_size = batch_rep.shape
-        # batch_rep = batch_rep.view(batch_size * bag_size, embedding_size)
 
         exp_reward = self.critic(batch_rep)
         action_probs = self.actor(batch_rep)
         action_probs = action_probs.squeeze(-1)
-        # action_probs = action_probs.view(batch_size, bag_size)
-        # exp_reward = exp_reward.view(batch_size, bag_size)
-        # batch_rep = batch_rep.view(batch_size, bag_size, embedding_size)
+        # ---- START DEBUG ----
+        if torch.any(torch.sum(action_probs, dim=1) == 0):
+            problematic_bags = action_probs[torch.sum(action_probs, dim=1) == 0]
+            print(f"WARNING PolicyNetwork.forward: Found bags where action_probs sum to 0! Values: {problematic_bags}")
 
-        # action_probs = action_probs[:, :, 1]
-        # action_probs = F.softmax(action_probs, dim=-1)
-        # from IPython import embed; embed(); exit()
-
+        if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+            print(f"ERROR PolicyNetwork.forward: action_probs contain NaN or Inf! Values: {action_probs}")
+        # ---- END DEBUG ----
         exp_reward = torch.mean(exp_reward, dim=1)
         return action_probs, batch_rep, exp_reward
 
@@ -652,144 +748,356 @@ class PolicyNetwork(nn.Module):
         for i, r in enumerate(self.rewards):
             self.rewards[i] = float((r - R_mean) / (R_std + eps))
 
-    def select_from_dataloader(self, dataloader, bag_size, random=False):
-        with torch.no_grad():
-            data = []
-            for batch_x, batch_y, indices, instance_labels in dataloader:
-                batch_x = batch_x.to(self.device)
-                # select batch_x
-                action_probs, _, _ = self.forward(batch_x)
-                action, _ = sample_action(action_probs, bag_size, self.device, random=random, algorithm=self.sample_algorithm)
-                batch_x = select_from_action(action, batch_x)
-                batch_x = batch_x.cpu()
-                data.append((batch_x, batch_y, indices, instance_labels))
-        return data
+    def select_from_dataloader(self, dataloader, device, bag_size, sample_algorithm, only_ensemble=False, epsilon=0.1):
+        data_pool_items = []
+
+        for batch_x_orig, batch_y_dict_orig, indices_orig, instance_labels_orig_batch in dataloader:
+            batch_x_orig = batch_x_orig.to(device)
+            action_probs, _, _ = self.forward(batch_x_orig)
+
+            action, _ = sample_action(
+                action_probs,
+                bag_size, # bag_size here is the number of items to select (k)
+                device=device,
+                random=(epsilon > np.random.random()) or only_ensemble,
+                algorithm=sample_algorithm
+            )
+
+            # Get the selected instances based on the actions
+            sel_x = select_from_action(action, batch_x_orig)
+
+            # Iterate through each bag in the original batch to create items for the pool
+            for i in range(len(batch_x_orig)):
+                sel_x_for_bag_item = sel_x[i].unsqueeze(0).cpu()
+
+                batch_y_dict_for_bag_item = {
+                    task: label_tensor[i].unsqueeze(0).cpu()
+                    for task, label_tensor in batch_y_dict_orig.items()
+                }
+
+                index_for_bag_item = indices_orig[i].cpu()
+
+                current_instance_labels = [] # Default
+                if instance_labels_orig_batch is not None:
+                    if isinstance(instance_labels_orig_batch, torch.Tensor) and instance_labels_orig_batch.ndim > 0 : # If it's a batched tensor
+                         if i < len(instance_labels_orig_batch): # Check bounds
+                            current_instance_labels = instance_labels_orig_batch[i].cpu() # If tensor, get i-th element
+                    elif isinstance(instance_labels_orig_batch, list):
+                        if i < len(instance_labels_orig_batch): # Check bounds
+                            item_instance_label = instance_labels_orig_batch[i]
+                            if isinstance(item_instance_label, torch.Tensor):
+                                current_instance_labels = item_instance_label.cpu()
+                            else: # Assuming it's already a list or suitable structure
+                                current_instance_labels = item_instance_label
+                    # If instance_labels_orig_batch is just one item (e.g. an empty list passed for all), handle appropriately
+                    elif not isinstance(instance_labels_orig_batch, list) and not isinstance(instance_labels_orig_batch, torch.Tensor) and i==0:
+                         current_instance_labels = instance_labels_orig_batch # Should ideally be a list per bag
+
+
+                data_pool_items.append((
+                    sel_x_for_bag_item,
+                    batch_y_dict_for_bag_item,
+                    index_for_bag_item,
+                    current_instance_labels  # The (potentially processed) instance labels for this one bag
+                ))
+        return data_pool_items
 
     def compute_reward(self, eval_data):
         with torch.no_grad():
-            data_ys, pred_ys, losses, prob_ys = [], [], [], []
-            for batch_x, batch_y, _, _ in eval_data:
-                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                pred_out, loss = self.eval_minibatch(batch_x, batch_y)
-                if self.task_type == 'regression':
-                    prob_y = pred_out
-                    pred_y = torch.clamp(pred_out, min=self.min_clip, max=self.max_clip)
-                elif self.task_type == 'classification':
-                    prob_y = torch.softmax(pred_out, dim=1)
-                    pred_y = torch.argmax(pred_out, dim=1)
-                    
-                pred_ys.append(pred_y.detach().cpu())
-                prob_ys.append(prob_y.detach().cpu())
-                data_ys.append(batch_y.detach().cpu())
-                losses.append(loss)
-            pred_Y = torch.cat(pred_ys, dim=0)
-            data_Y = torch.cat(data_ys, dim=0)
-            prob_Y = torch.cat(prob_ys, dim=0)
-            if self.task_type == 'classification':
-                reward = f1_score(data_Y.data, pred_Y.data, average='macro')
-            elif self.task_type == 'regression':   
-                reward = r2_score(data_Y.data, pred_Y.data)
-        return reward, np.mean(losses), prob_Y, data_Y
+            task_data_ys_all = {task: [] for task in self.task_names}
+            task_pred_ys_all = {task: [] for task in self.task_names}
+            # task_prob_ys_all = {task: [] for task in self.task_names} # If needed for other metrics like AUC
+
+            all_batch_combined_loss_items = []
+
+            for batch_x, batch_y_dict, _, _ in eval_data:
+                batch_x = batch_x.to(self.device)
+                batch_y_dict_device = {k: v.to(self.device) for k, v in batch_y_dict.items()}
+
+                pred_out_dict, combined_loss_item, individual_batch_losses = self.eval_minibatch(batch_x, batch_y_dict_device)
+                all_batch_combined_loss_items.append(combined_loss_item)
+
+                for task_name in self.task_names:
+                    pred_out_task = pred_out_dict[task_name]
+                    batch_y_task_cpu = batch_y_dict[task_name]
+
+                    pred_y_task = torch.argmax(pred_out_task, dim=1) # Assuming classification
+
+                    task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
+                    task_data_ys_all[task_name].append(batch_y_task_cpu)
+                    # task_losses[task_name].append(individual_batch_losses[task_name]) # Accumulate individual losses if needed
+
+            # Calculate F1 for each task and average for combined reward
+            task_f1_scores = {}
+            all_task_preds_final_for_reward = {}
+            all_task_labels_final_for_reward = {}
+
+            for task_name in self.task_names:
+                pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0)
+                data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0)
+
+                all_task_preds_final_for_reward[task_name] = pred_Y_task
+                all_task_labels_final_for_reward[task_name] = data_Y_task
+
+                task_f1_scores[task_name] = f1_score(data_Y_task.data.numpy(), pred_Y_task.data.numpy(), average='macro', zero_division=0)
+
+            combined_scalar_reward = np.mean(list(task_f1_scores.values()))
+            mean_overall_combined_loss = np.mean(all_batch_combined_loss_items)
+
+        # Return:
+        # 1. combined_scalar_reward (for RL agent)
+        # 2. mean_overall_combined_loss (for logging/evaluation)
+        # 3. all_task_preds_final_for_reward (dict: task -> tensor of predictions for this eval_data pass)
+        # 4. all_task_labels_final_for_reward (dict: task -> tensor of labels for this eval_data pass)
+        return combined_scalar_reward, mean_overall_combined_loss, all_task_preds_final_for_reward, all_task_labels_final_for_reward
+
 
     def compute_metrics_and_details(self, eval_data):
         with torch.no_grad():
-            data_ys, pred_ys, losses, prob_ys = [], [], [], []
-            for batch_x, batch_y, _, _ in eval_data:
-                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                pred_out, loss = self.eval_minibatch(batch_x, batch_y)
-                if self.task_type == 'regression':
-                    prob_y = pred_out
-                    pred_y = torch.clamp(pred_out, min=self.min_clip, max=self.max_clip)
-                elif self.task_type == 'classification':
-                    prob_y = torch.softmax(pred_out, dim=1)
-                    pred_y = torch.argmax(pred_out, dim=1)
-                    
-                pred_ys.append(pred_y.detach().cpu())
-                prob_ys.append(prob_y.detach().cpu())
-                data_ys.append(batch_y.detach().cpu())
-                losses.append(loss)
-            pred_Y = torch.cat(pred_ys, dim=0)
-            data_Y = torch.cat(data_ys, dim=0)
-            prob_Y = torch.cat(prob_ys, dim=0)
-            metrics = {'loss': np.mean(losses)}
-            if self.task_type == 'classification':
-                f1_macro = f1_score(data_Y.data, pred_Y.data, average='macro')
-                f1_micro = f1_score(data_Y.data, pred_Y.data, average='micro')
-                if prob_Y.shape[1] == 2:
-                    auc = roc_auc_score(data_Y.data, prob_Y.data[:, 1], average='macro')
-                else:
-                    auc = roc_auc_score(data_Y.data, prob_Y.data, average='macro', multi_class='ovr')
-                metrics.update({
-                    'f1': f1_macro,
-                    'f1_micro': f1_micro,
-                    'auc': auc,
-                })
-            elif self.task_type == 'regression':   
-                reward = r2_score(data_Y.data, pred_Y.data)
-                metrics.update({
-                    'r2': reward,
-                })
-        return metrics, prob_Y.tolist(), data_Y.tolist(), pred_Y.tolist()
-    
+            task_data_ys_all = {task: [] for task in self.task_names}
+            task_pred_ys_all = {task: [] for task in self.task_names}
+            task_prob_ys_all = {task: [] for task in self.task_names}
+            batch_losses_all = [] # Stores the combined loss from each batch
+
+            for batch_x, batch_y_dict, _, _ in eval_data:
+                batch_x = batch_x.to(self.device)
+                batch_y_dict_device = {k: v.to(self.device) for k, v in batch_y_dict.items()}
+
+                pred_out_dict, combined_loss_item, _ = self.eval_minibatch(batch_x, batch_y_dict_device)
+                batch_losses_all.append(combined_loss_item)
+
+                for task_name in self.task_names:
+                    pred_out_task = pred_out_dict[task_name]
+
+                    prob_y_task = torch.softmax(pred_out_task, dim=1)
+                    pred_y_task = torch.argmax(pred_out_task, dim=1)
+
+                    task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
+                    task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
+                    task_data_ys_all[task_name].append(batch_y_dict[task_name].cpu()) # Original CPU labels
+
+            metrics_summary = {'loss': np.mean(batch_losses_all)} # Average of combined losses
+            all_probs_final = {}
+            all_labels_final = {}
+            all_preds_final = {}
+
+            for task_name in self.task_names:
+                data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0).numpy()
+                pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0).numpy()
+                prob_Y_task = torch.cat(task_prob_ys_all[task_name], dim=0).numpy()
+
+                all_labels_final[task_name] = data_Y_task.tolist()
+                all_preds_final[task_name] = pred_Y_task.tolist()
+                all_probs_final[task_name] = prob_Y_task.tolist()
+
+                f1_macro = f1_score(data_Y_task, pred_Y_task, average='macro', zero_division=0)
+                f1_micro = f1_score(data_Y_task, pred_Y_task, average='micro', zero_division=0)
+                acc = np.mean(data_Y_task == pred_Y_task) # accuracy_score
+
+                # AUC
+                if prob_Y_task.shape[1] == 2: # Binary classification
+                    auc_score = roc_auc_score(data_Y_task, prob_Y_task[:, 1], average='macro')
+                else: # Multi-class
+                    auc_score = roc_auc_score(data_Y_task, prob_Y_task, average='macro', multi_class='ovr')
+
+                metrics_summary[f'{task_name}/f1'] = f1_macro
+                metrics_summary[f'{task_name}/f1_micro'] = f1_micro
+                metrics_summary[f'{task_name}/auc'] = auc_score
+                metrics_summary[f'{task_name}/accuracy'] = acc
+
+        # Return: metrics_summary (dict of metrics),
+        # all_probs_final (dict task -> list of prob lists),
+        # all_labels_final (dict task -> list of labels),
+        # all_preds_final (dict task -> list of preds)
+        return metrics_summary, all_probs_final, all_labels_final, all_preds_final
+
     def train_minibatch(self, batch_x, batch_y):
         self.task_model.train()
         batch_out = self.task_model(batch_x)
-        batch_loss = self.loss_fn(batch_out.squeeze(), batch_y.squeeze())
-        self.task_optim.zero_grad()
-        batch_loss.backward()
-        self.task_optim.step()
-        return batch_loss.item()
+        total_loss = 0
+        individual_losses = {}
+        for task_name, preds_task in batch_out.items():
+            loss = self.loss_fns[task_name](preds_task.squeeze(), batch_out[task_name].squeeze())
+            total_loss += loss
+            individual_losses[task_name] = loss.item()
+
+        if self.task_optim: # Check if optimizer is defined
+            self.task_optim.zero_grad()
+            total_loss.backward()
+            self.task_optim.step()
+        return total_loss.item() # Return combined loss
 
     def eval_minibatch(self, batch_x, batch_y):
         self.task_model.eval()
         batch_out = self.task_model(batch_x)
-        batch_loss = self.loss_fn(batch_out.squeeze(), batch_y.squeeze())
-        return batch_out, batch_loss.item()
+        total_loss = 0
+        individual_losses = {}
+        for task_name, preds_task in batch_out.items():
+            loss = self.loss_fns[task_name](preds_task.squeeze(), batch_out[task_name].squeeze())
+            total_loss += loss
+            individual_losses[task_name] = loss.item()
+
+        return batch_out, total_loss.item(), individual_losses # Return dict of outs, combined loss
 
     def create_pool_data(self, dataloader, bag_size, pool_size, random=False):
-        pool = []
+        list_of_batches = []
         for _ in range(pool_size):
-            data = self.select_from_dataloader(dataloader, bag_size, random=random)
-            pool.append(data)
-        return pool
+            current_epsilon = getattr(self, 'epsilon', 0.1)
 
-    def expected_reward_loss(self, pool_data, average='macro', verbos=False):
-        reward_pool, loss_pool, preds_pool = [], [], []
-        for data in pool_data:
-            reward, loss, preds, labels = self.compute_reward(data)
-            reward_pool.append(reward)
-            loss_pool.append(loss)
-            preds_pool.append(preds)
-        if self.task_type == 'classification':
-            preds_pool = torch.stack(preds_pool, dim=2).mean(dim=2).argmax(dim=1)
-            ensemble_reward = f1_score(labels.data, preds_pool.data, average=average)
-        elif self.task_type == 'regression':
-            preds_pool = torch.stack(preds_pool, dim=2).mean(dim=2).squeeze()
-            preds_pool = torch.clamp(preds_pool, min=self.min_clip, max=self.max_clip)
-            ensemble_reward = r2_score(labels.data, preds_pool.data)
-        mean_reward = np.mean(reward_pool)
-        mean_loss = np.mean(loss_pool)
-        return mean_reward, mean_loss, ensemble_reward
-    
-    def predict_pool(self, pool_data):
-        probs_pool = []
-        for data in pool_data:
-            prob_Y = self.predict(data)
-            probs_pool.append(prob_Y)
-        preds_pool = torch.stack(probs_pool, dim=2).mean(dim=2).argmax(dim=1)
-        return preds_pool
+            data = self.select_from_dataloader(
+                dataloader=dataloader,
+                device=self.device,
+                bag_size=bag_size,
+                sample_algorithm=self.sample_algorithm,
+                only_ensemble=random,
+                epsilon=current_epsilon
+            )
+            list_of_batches.append(data)
+        return list_of_batches
 
-    def predict(self, data):
+    def expected_reward_loss(self, pool_data, average='macro', verbos=False): # [cite: 1]
+        # pool_data is a list of lists. Each inner list is the result of one select_from_dataloader call.
+        # Each item in the inner list is a tuple: (sel_x_for_bag_item, batch_y_dict_for_bag_item, index_for_bag_item, current_instance_labels)
+
+        reward_pool, loss_pool = [], []
+
+        task_ensembled_preds = {task_name: [] for task_name in self.task_names}
+        task_labels_for_ensemble = {task_name: None for task_name in self.task_names}
+
+        # Check if pool_data itself or its first element (a list of batches/items from one selection run) is empty
+        if not pool_data or not pool_data[0]:
+            # logger is not defined in this scope, but ideally, you'd log this.
+            # For now, printing a warning. In your actual code, ensure 'logger' is accessible.
+            print("WARNING: expected_reward_loss - pool_data is empty or its first selection run is empty. Returning default 0.0 rewards/loss.")
+            return 0.0, 0.0, 0.0
+
+        first_data_load_for_labels = True # To get labels for ensemble F1 calculation just once
+        for data_selection_run in pool_data: # Each item is a list of (sel_x, y_dict, idx, inst_labels) tuples from one policy rollout
+            if not data_selection_run:
+                # This means one of the policy rollouts/selections over the dataloader resulted in no data.
+                # This could happen if select_from_dataloader returned an empty list.
+                print("WARNING: expected_reward_loss - A data_selection_run in pool_data is empty. Appending default reward/loss for this run.")
+                reward_pool.append(0.0)
+                loss_pool.append(0.0) # Use 0.0 for loss to avoid NaN issues with np.mean if all are problematic
+                # For ensemble predictions, this run contributes nothing or needs careful handling.
+                # For simplicity, we'll let the existing logic for task_ensembled_preds handle potentially shorter lists.
+                continue
+
+            # compute_reward expects a list of these tuples (effectively, a batch of selected bags)
+            reward, loss, preds_dict_for_run, labels_dict_for_run = self.compute_reward(data_selection_run)
+
+            reward_pool.append(reward if reward is not None and not np.isnan(reward) else 0.0)
+            loss_pool.append(loss if loss is not None and not np.isnan(loss) else 0.0)
+
+            for task_name in self.task_names:
+                if task_name in preds_dict_for_run and preds_dict_for_run[task_name] is not None:
+                    # Ensure preds_dict_for_run[task_name] is a tensor before appending
+                    # compute_reward should return tensors for predictions
+                    if isinstance(preds_dict_for_run[task_name], torch.Tensor):
+                        task_ensembled_preds[task_name].append(preds_dict_for_run[task_name])
+                    else:
+                        # This case should ideally not happen if compute_reward is consistent
+                        print(f"WARNING: Preds for task {task_name} in one run was not a tensor.")
+
+                if first_data_load_for_labels and task_name in labels_dict_for_run and labels_dict_for_run[task_name] is not None:
+                     if isinstance(labels_dict_for_run[task_name], torch.Tensor):
+                        task_labels_for_ensemble[task_name] = labels_dict_for_run[task_name]
+                     else:
+                        print(f"WARNING: Labels for task {task_name} in first run was not a tensor.")
+            first_data_load_for_labels = False
+
+        # Calculate mean reward and loss, handling empty or all-NaN cases
+        mean_reward = np.mean(reward_pool) if reward_pool and not all(np.isnan(r) or r is None for r in reward_pool) else 0.0
+        mean_loss = np.mean(loss_pool) if loss_pool and not all(np.isnan(l) or l is None for l in loss_pool) else 0.0
+
+        ensemble_f1_scores_per_task = {}
+        for task_name in self.task_names:
+            if task_labels_for_ensemble[task_name] is not None and len(task_labels_for_ensemble[task_name]) > 0 and \
+               task_name in task_ensembled_preds and task_ensembled_preds[task_name]:
+
+                # Filter out any potential non-tensor entries if they slipped through (defensive)
+                valid_preds_for_stack = [p for p in task_ensembled_preds[task_name] if isinstance(p, torch.Tensor) and p.ndim > 0]
+
+                if not valid_preds_for_stack:
+                    # print(f"WARNING: No valid tensor predictions for task {task_name} for ensemble F1 calculation.")
+                    ensemble_f1_scores_per_task[task_name] = 0.0
+                    continue
+
+                try:
+                    # Assuming predictions are class indices (1D tensors per selection run)
+                    # Shape of each p in valid_preds_for_stack should be (num_samples_in_batch_from_selection_run)
+                    # We need to ensure they are concatenable or stackable. If num_samples varies, mode might be tricky.
+                    # Assuming for now each selection run processes the same set of eval items.
+                    stacked_preds_for_task = torch.stack(valid_preds_for_stack, dim=0) # Shape: (pool_size, num_samples)
+                    ensembled_final_preds_task, _ = torch.mode(stacked_preds_for_task, dim=0)
+
+                    labels_task_np = task_labels_for_ensemble[task_name].data.cpu().numpy()
+                    ensembled_preds_np = ensembled_final_preds_task.data.cpu().numpy()
+
+                    if len(np.unique(labels_task_np)) < 2 and len(labels_task_np) > 0: # Only one class present in true labels
+                         # print(f"INFO: Only one class present in true labels for task {task_name}. F1 is 0 if predictions differ, or 1 if all match (problematic for macro F1). Defaulting to 0 for safety.")
+                         f1_val = 0.0
+                         if np.all(labels_task_np == ensembled_preds_np): # If all preds match the single true class
+                             # This edge case might need specific handling depending on desired F1 interpretation
+                             # For macro-F1 with single true class, scikit-learn might warn or give 0.
+                             # Let's assume if perfect match to single class, it's 1.0 (for that class), but macro needs care.
+                             # Scikit-learn f1_score with average='macro' and single class in y_true typically gives 0 unless y_pred also only has that class.
+                              pass # f1_val stays 0.0 or as per scikit-learn's behavior for single class.
+
+                    ensemble_f1_scores_per_task[task_name] = f1_score(labels_task_np,
+                                                                  ensembled_preds_np,
+                                                                  average=average, zero_division=0)
+                except Exception as e:
+                    print(f"ERROR: Calculating ensemble F1 for task {task_name}: {e}")
+                    ensemble_f1_scores_per_task[task_name] = 0.0
+            else:
+                # print(f"INFO: Not enough data to calculate ensemble F1 for task {task_name}.")
+                ensemble_f1_scores_per_task[task_name] = 0.0
+
+        ensemble_f1_values = list(ensemble_f1_scores_per_task.values())
+        valid_f1_values_ens = [f1 for f1 in ensemble_f1_values if isinstance(f1, (int, float)) and not np.isnan(f1)]
+        ensemble_reward = np.mean(valid_f1_values_ens) if valid_f1_values_ens else 0.0
+
+        # Ensure all returned values are floats and not None or NaN
+        final_mean_reward = mean_reward if isinstance(mean_reward, (int, float)) and not np.isnan(mean_reward) else 0.0
+        final_mean_loss = mean_loss if isinstance(mean_loss, (int, float)) and not np.isnan(mean_loss) else 0.0
+        final_ensemble_reward = ensemble_reward if isinstance(ensemble_reward, (int, float)) and not np.isnan(ensemble_reward) else 0.0
+
+        return final_mean_reward, final_mean_loss, final_ensemble_reward
+
+    def predict(self, data_batches):
+        self.task_model.eval()
+        task_prob_ys_all = {task: [] for task in self.task_names}
         with torch.no_grad():
-            prob_ys = []
-            for batch_x in data:
+            for batch_x, _, _, _ in data_batches: # y is not used for prediction here
                 batch_x = batch_x.to(self.device)
-                pred_out = self.task_model(batch_x)
-                prob_y = torch.softmax(pred_out, dim=1)
-                prob_ys.append(prob_y.detach().cpu())
-            prob_Y = torch.cat(prob_ys, dim=0)
-        return prob_Y
-    
+                pred_out_dict = self.task_model(batch_x)
+                for task_name in self.task_names:
+                    prob_y_task = torch.softmax(pred_out_dict[task_name], dim=1)
+                    task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
+
+        concatenated_probs = {}
+        for task_name in self.task_names:
+            concatenated_probs[task_name] = torch.cat(task_prob_ys_all[task_name], dim=0)
+        return concatenated_probs
+
+    def predict_pool(self, pool_data):
+        all_task_probs_from_pool = {task: [] for task in self.task_names}
+
+        for data_item in pool_data:
+            prob_dict_one_selection = self.predict(data_item) # Returns dict: task -> probs for this selection
+            for task_name in self.task_names:
+                all_task_probs_from_pool[task_name].append(prob_dict_one_selection[task_name])
+
+        ensembled_final_preds = {}
+        for task_name in self.task_names:
+            # Stack probs for this task: (pool_size, num_samples, num_classes)
+            stacked_probs_task = torch.stack(all_task_probs_from_pool[task_name], dim=0)
+            mean_probs_task = torch.mean(stacked_probs_task, dim=0) #Shape: (num_samples, num_classes)
+            ensembled_final_preds[task_name] = torch.argmax(mean_probs_task, dim=1)
+
+        return ensembled_final_preds
+
     def ensemble_predict(self, pool_data):
         preds_pool = []
         for data in pool_data:

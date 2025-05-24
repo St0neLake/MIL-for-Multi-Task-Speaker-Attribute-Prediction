@@ -114,12 +114,12 @@ if __name__ == '__main__':
 
     sweep_run_dir = get_model_save_directory(dataset=args.dataset,
                                        data_embedded_column_name=args.data_embedded_column_name,
-                                       embedding_model_name=args.embedding_model, 
+                                       embedding_model_name=args.embedding_model,
                                        target_column_name=args.label,
                                        bag_size=args.bag_size, baseline=args.baseline,
-                                       autoencoder_layers=args.autoencoder_layer_sizes, random_seed=args.sweep_random_seed, 
+                                       autoencoder_layers=args.autoencoder_layer_sizes, random_seed=args.sweep_random_seed,
                                        dev=dev, task_type=task_type, prefix=None)
-    
+
     # mil_config = load_json(os.path.join(sweep_run_dir, "best_model_config.json"))
     directories = [name for name in os.listdir(sweep_run_dir) if os.path.isdir(os.path.join(sweep_run_dir, name))]
     directories = ['only_ensemble_loss'] + [name for name in directories if name.startswith('neg')]
@@ -131,7 +131,7 @@ if __name__ == '__main__':
         for k, dict in config['sweep_config']['parameters'].items():
             if dict['distribution'] == 'constant':
                 config[k] = dict['value']
-        
+
         config.pop("sweep_config", None)
 
         # Set run_sweep to False
@@ -139,7 +139,7 @@ if __name__ == '__main__':
 
         # Set the random seed for both of them
         config["random_seed"] = args.random_seed
-    
+
         # Do the same for RL models
         run_rl_models_python_script_command = (
             f"./venv/bin/python3 run_rlmil.py "
@@ -184,10 +184,10 @@ if __name__ == '__main__':
             run_rl_models_python_script_command += f"--only_ensemble "
         if config['reg_alg']:
             run_rl_models_python_script_command += f"--reg_alg {config['reg_alg']} "
-        
+
         if config['no_autoencoder_for_rl']:
             run_rl_models_python_script_command += f"--no_autoencoder_for_rl "
-        
+
         run_rl_models_session_name = f"rl_{args.dataset}_{args.label}_{args.baseline}"
         # pass CUDA_VISIBLE_DEVICES to the subprocess as an environment variable
         run_rl_result = subprocess.run(shlex.split(run_rl_models_python_script_command),
