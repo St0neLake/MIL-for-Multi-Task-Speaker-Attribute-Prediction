@@ -43,6 +43,7 @@ eval_pool_size=10        # From your script
 test_pool_size=10        # From your script
 epsilon=0.1              # Placeholder for epsilon_greedy
 reg_coef=0.01            # Placeholder for reg_alg="sum"
+mil_task_head_hidden_dim=512
 
 # This random seed will be used for this specific MTL run (data splitting, initializations)
 # Your original script used random_seed 0 for sweeps, and 42 for a specific run. Let's use 42.
@@ -89,6 +90,7 @@ PYTHON_CMD="python3 run_rlmil.py \
     --critic_learning_rate $critic_learning_rate \
     --learning_rate $learning_rate \
     --hdim $hdim \
+    --hidden_dim $mil_task_head_hidden_dim \
     --epsilon $epsilon \
     --reg_coef $reg_coef \
     --gpu $mtl_gpu_id" # Pass the GPU index for run_rlmil.py's internal use if needed

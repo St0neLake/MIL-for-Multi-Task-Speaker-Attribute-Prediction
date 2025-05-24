@@ -9,8 +9,8 @@ num_pos_samples=5 # only used in jigsaw datasets, 5 for making `jigsaw_5` and 10
 
 data_embedded_column_name="text" # or "text"
 
-random_seeds=(42 43 44 45 46)
-gpus=(0 1 2 3 4)
+random_seeds=(1)
+gpus=(0)
 
 # ---- Constants ----
 embedding_model="roberta-base"

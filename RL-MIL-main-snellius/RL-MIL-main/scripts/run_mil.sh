@@ -3,21 +3,21 @@
 cd ..
 source venv/bin/activate
 
-baseline_types=("MeanMLP" "MaxMLP" "AttentionMLP" "repset")
+baseline_types=("MeanMLP")
 
 # For facebook dataset: ("care" "purity" "loyalty" "authority" "fairness")
 # For political_data_with_age dataset: ("age" "gender" "party")
 # For jigsaw datasets: ("hate")
-target_labels=("care" "purity" "loyalty" "authority" "fairness")
+target_labels=("age" "gender" "party")
 
-gpus=(0 1 2 3 4 5 6 7)
+gpus=(0 1 2 3)
 
 # wandb config
-wandb_entity="YOUR_WANDB_ENTITY"
-wandb_project="YOUR_WANDB_PROJECT_NAME"
+wandb_entity="stonelake-university-of-amsterdam"
+wandb_project="MIL"
 
 # Dataset is either: `political_data_with_age,` `facebook,` `jigsaw_5,` or `jigsaw_10`
-dataset="facebook"
+dataset="political_data_with_age"
 
 # For `facebook` and `political_data_with_age` datasets: "text"
 # For `jigsaw` datasets: "comment_text"
@@ -70,9 +70,9 @@ for target_label_index in "${!target_labels[@]}"; do
                                       --autoencoder_layer_sizes $autoencoder_layer_sizes \
                                       --data_embedded_column_name $data_embedded_column_name \
                                       --task_type $task_type \
-                                      --random_seed 0 ;
+                                      --random_seed 44 ;
         exit"
-        
+
         ((current_run++))
       done
     done
