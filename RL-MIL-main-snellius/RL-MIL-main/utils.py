@@ -14,6 +14,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, r2_
 from sklearn.preprocessing import LabelEncoder
 from torch.nn import functional as F
 from yaml.loader import SafeLoader
+from sklearn.cluster import KMeans
 
 from models import create_mil_model
 
@@ -626,3 +627,113 @@ def get_balanced_weights(labels):
 
     sample_weights = [perfect_balance_weights[t] for t in labels]
     return sample_weights
+
+def get_task_representations_from_activations(task_model, dataloader, task_names, device):
+    task_model.eval()
+
+    # Each list will store [num_bags_in_batch, hidden_dim_of_first_head_layer] tensors
+    task_activation_accumulators = {task: [] for task in task_names}
+
+    with torch.no_grad():
+        for batch_x, _, _, _ in dataloader:
+            batch_x = batch_x.to(device)
+
+            # 1. Get aggregated bag features from the shared base_network
+            shared_instance_embeddings = task_model.base_network(batch_x)
+            x_aggregated_bag_features = task_model.aggregate(shared_instance_embeddings)
+
+            # 2. For each task, get activations from the first hidden layer of its head
+            for task_name in task_names:
+                if task_name in task_model.task_heads:
+                    task_head_mlp = task_model.task_heads[task_name]
+                    hidden_activations = task_head_mlp[1](task_head_mlp[0](x_aggregated_bag_features))
+                    task_activation_accumulators[task_name].append(hidden_activations.cpu())
+                else:
+                    print(f"Warning: Task head for {task_name} not found in task_model.")
+
+    # 3. Consolidate and average activations for each task
+    task_representation_vectors = {}
+    for task_name in task_names:
+        if task_activation_accumulators[task_name]:
+            all_activations_for_task = torch.cat(task_activation_accumulators[task_name], dim=0)
+            task_representation_vectors[task_name] = torch.mean(all_activations_for_task, dim=0)
+        else:
+            hidden_dim = task_model.task_heads[task_names[0]][0].out_features
+            task_representation_vectors[task_name] = torch.zeros(hidden_dim)
+            print(f"Warning: No activations found for task {task_name}, returning zero vector.")
+
+    return task_representation_vectors
+
+def calculate_task_similarity_matrix(task_representation_vectors, task_names):
+    # Initialize a square matrix with zeros, where the number of rows and columns is equal to the number of tasks.
+    num_tasks = len(task_names)
+    similarity_matrix = np.zeros((num_tasks, num_tasks))
+
+    # Loop through each pair of tasks.
+    for i in range(num_tasks):
+        for j in range(num_tasks):
+            if i == j:
+                # If it's the same task, set the similarity to 1.0 (perfectly similar).
+                similarity_matrix[i, j] = 1.0
+            else:
+                task_i_name = task_names[i]
+                task_j_name = task_names[j]
+
+                vec_i = task_representation_vectors.get(task_i_name)
+                vec_j = task_representation_vectors.get(task_j_name)
+
+                # If the representation vector is not found for either task, print a warning and set similarity to 0.
+                if vec_i is None or vec_j is None:
+                    print(f"Warning: Representation vector not found for {task_i_name} or {task_j_name}. Setting similarity to 0.")
+                    similarity_matrix[i, j] = 0.0
+                    continue
+
+                # Calculate the cosine similarity between the two vectors and store it in the matrix.
+                similarity = F.cosine_similarity(vec_i.unsqueeze(0), vec_j.unsqueeze(0))
+                similarity_matrix[i, j] = similarity.item()
+
+    # Convert the similarity matrix to a pandas DataFrame for easier interpretation.
+    similarity_df = pd.DataFrame(similarity_matrix, index=task_names, columns=task_names)
+    return similarity_df
+
+def assign_tasks_to_clusters(task_representation_vectors, task_names, num_clusters=2, random_state=None):
+    if not task_representation_vectors or len(task_names) < num_clusters:
+        print("Warning: Not enough tasks or representations to cluster, assigning all to cluster 0 or returning empty.")
+        if not task_names:
+            return {}
+        return {task_name: 0 for task_name in task_names}
+
+    feature_matrix = []
+    for task_name in task_names:
+        if task_name in task_representation_vectors:
+            feature_matrix.append(task_representation_vectors[task_name].cpu().numpy())
+        else:
+            print(f"Warning: Missing representation for task {task_name} in assign_tasks_to_clusters. Skipping.")
+
+    if not feature_matrix or len(feature_matrix) < num_clusters:
+        print("Warning: Not enough task feature vectors for clustering after filtering. Assigning available to cluster 0.")
+        return {task_name: 0 for task_name in task_representation_vectors.keys() if task_name in task_names}
+
+
+    feature_matrix_np = np.array(feature_matrix)
+
+    if feature_matrix_np.shape[0] < num_clusters:
+        print(f"Warning: Number of tasks with representations ({feature_matrix_np.shape[0]}) is less than num_clusters ({num_clusters}). Assigning each to its own cluster if possible, or all to 0.")
+        if feature_matrix_np.shape[0] == 0: return {}
+        return {task_names[i]: i for i in range(feature_matrix_np.shape[0])}
+
+
+    kmeans = KMeans(n_clusters=num_clusters, random_state=random_state, n_init='auto')
+    try:
+        cluster_labels = kmeans.fit_predict(feature_matrix_np)
+    except ValueError as e:
+        print(f"Error during KMeans fitting: {e}. This can happen if n_samples < n_clusters. Assigning tasks to default clusters.")
+        if feature_matrix_np.shape[0] < num_clusters:
+             return {task_names[i]: i for i in range(feature_matrix_np.shape[0])}
+        else:
+            return {task_name: 0 for task_name in task_names}
+
+
+    task_to_cluster_id = {task_name: label for task_name, label in zip(task_names, cluster_labels)}
+
+    return task_to_cluster_id

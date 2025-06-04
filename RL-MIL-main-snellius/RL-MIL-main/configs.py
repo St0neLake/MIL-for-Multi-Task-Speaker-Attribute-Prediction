@@ -227,6 +227,44 @@ def parse_args():
         required=False,
     )
 
+    # --- Arguments for Task Clustering ---
+    parser.add_argument(
+        "--clustering_active",
+        action="store_true",
+        help="Activate task clustering."
+    )
+    parser.add_argument(
+        "--num_task_clusters",
+        type=int,
+        default=2, # Default to 2 for your 3 tasks (age, gender, party)
+        help="Number of task clusters (K) for K-Means."
+    )
+    parser.add_argument(
+        "--hidden_dim_cluster_trunk",
+        type=int,
+        default=128, # Example default, tune as needed
+        help="Hidden dimension for the MLP trunks shared by tasks within a cluster."
+    )
+    parser.add_argument(
+        "--hidden_dim_final_head", # This might reuse existing --hidden_dim if appropriate
+        type=int,
+        default=64,  # Example default, tune as needed
+        help="Hidden dimension for the final task-specific layers on top of cluster trunks."
+    )
+    parser.add_argument(
+        "--recluster_interval_E",
+        type=int,
+        default=10, # Re-cluster every 10 epochs, for example
+        help="Epoch interval for re-clustering tasks."
+    )
+    parser.add_argument(
+        "--kmeans_random_state",
+        type=int,
+        default=42,
+        help="Random state for KMeans for reproducibility."
+    )
+    # --- End Task Clustering Arguments ---
+
     # Optional arguments
     parser.add_argument(
         "--autoencoder_layer_sizes", type=str, required=False, default=None
