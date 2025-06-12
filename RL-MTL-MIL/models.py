@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, f1_score, r2_score, roc_auc_score
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, f1_score, r2_score, roc_auc_score, accuracy_score
 
 def build_layers(sizes):
     layers = []
@@ -108,7 +108,7 @@ class BaseMLP(nn.Module, ABC):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_to_cluster_id_map: dict = None) -> torch.Tensor:
         x = self.base_network(x)
         aggregated_x = self.aggregate(x)
 
@@ -155,6 +155,83 @@ class MeanMLP(BaseMLP):
         return torch.mean(x, dim=1)  # Compute the mean along the bag_size dimension
 
 
+class ClusteredMeanMLP(BaseMLP):
+    def __init__(
+            self,
+            input_dim: int,
+            output_dims_dict: dict[str, int],
+            num_clusters: int,
+            hidden_dim_cluster_trunk: int,
+            hidden_dim_final_head: int,
+            autoencoder_layer_sizes: list = None, # <<<< THIS PARAMETER IS NOW CORRECTLY DEFINED
+            dropout_p: float = 0.5
+    ):
+        # Initialize the parent BaseMLP, passing all required arguments to it.
+        # The BaseMLP.__init__ in your Snellius version expects all these arguments.
+        super(ClusteredMeanMLP, self).__init__(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim_final_head, # BaseMLP's hidden_dim is for the final heads
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes # Pass this to the parent
+        )
+
+        self.num_clusters = num_clusters
+        self.task_names = list(output_dims_dict.keys())
+
+        # self.base_network is created by BaseMLP's __init__
+        # self.input_dim_for_aggregation is also set by BaseMLP's __init__
+        dim_input_to_trunks = self.input_dim_for_aggregation
+
+        # Define Cluster-Specific Trunks
+        self.cluster_trunks = nn.ModuleList()
+        for _ in range(num_clusters):
+            trunk = nn.Sequential(
+                nn.Linear(dim_input_to_trunks, hidden_dim_cluster_trunk),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p)
+            )
+            self.cluster_trunks.append(trunk)
+
+        # Redefine self.task_heads from BaseMLP to sit on top of the new cluster trunks.
+        # The original self.task_heads created by BaseMLP will be replaced by this new ModuleDict.
+        self.task_heads = nn.ModuleDict()
+        for task_name, num_classes_for_task in self.output_dims_dict.items():
+            # This final head takes the output from a cluster_trunk.
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(hidden_dim_cluster_trunk, hidden_dim_final_head),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p),
+                nn.Linear(hidden_dim_final_head, num_classes_for_task)
+            )
+
+        self.initialize_weights() # Ensure all newly defined layers are properly initialized
+
+    def aggregate(self, x_encoded_instances):
+        return torch.mean(x_encoded_instances, dim=1)
+
+    def forward(self, x_instance_embeddings, task_to_cluster_id_map: dict):
+        x_shared_instance_features = self.base_network(x_instance_embeddings)
+        x_aggregated_bag_features = self.aggregate(x_shared_instance_features)
+
+        outputs = {}
+        for task_name in self.task_names:
+            cluster_id = task_to_cluster_id_map.get(task_name)
+
+            if cluster_id is None or not (0 <= cluster_id < self.num_clusters):
+                print(f"Error: Task {task_name} has invalid or missing cluster_id: {cluster_id}. Number of clusters: {self.num_clusters}. Skipping task.")
+                num_classes_for_task = self.output_dims_dict.get(task_name)
+                if num_classes_for_task is not None:
+                    batch_s = x_aggregated_bag_features.shape[0]
+                    outputs[task_name] = torch.zeros(batch_s, num_classes_for_task).to(x_instance_embeddings.device)
+                continue
+
+            trunk_output = self.cluster_trunks[cluster_id](x_aggregated_bag_features)
+            outputs[task_name] = self.task_heads[task_name](trunk_output)
+
+        return outputs
+
+
 class MaxMLP(BaseMLP):
     def __init__(
             self,
@@ -177,6 +254,81 @@ class MaxMLP(BaseMLP):
         return torch.max(
             x, dim=1
         ).values  # Compute the max along the bag_size dimension
+
+
+class ClusteredMaxMLP(BaseMLP):
+    def __init__(
+            self,
+            input_dim: int,
+            output_dims_dict: dict[str, int],
+            num_clusters: int,
+            hidden_dim_cluster_trunk: int,
+            hidden_dim_final_head: int,
+            autoencoder_layer_sizes: list = None,
+            dropout_p: float = 0.5
+    ):
+        # Initialize the parent BaseMLP
+        super(ClusteredMaxMLP, self).__init__(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim_final_head, # BaseMLP's hidden_dim is for the final heads
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes
+        )
+
+        self.num_clusters = num_clusters
+        self.task_names = list(output_dims_dict.keys())
+
+        # self.base_network is created by BaseMLP's __init__
+        # self.input_dim_for_aggregation is also set by BaseMLP's __init__
+        dim_input_to_trunks = self.input_dim_for_aggregation
+
+        # Define Cluster-Specific Trunks
+        self.cluster_trunks = nn.ModuleList()
+        for _ in range(num_clusters):
+            trunk = nn.Sequential(
+                nn.Linear(dim_input_to_trunks, hidden_dim_cluster_trunk),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p)
+            )
+            self.cluster_trunks.append(trunk)
+
+        # Redefine self.task_heads to sit on top of the new cluster trunks
+        self.task_heads = nn.ModuleDict()
+        for task_name, num_classes_for_task in self.output_dims_dict.items():
+            # This final head takes the output from a cluster_trunk
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(hidden_dim_cluster_trunk, hidden_dim_final_head),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p),
+                nn.Linear(hidden_dim_final_head, num_classes_for_task)
+            )
+
+        self.initialize_weights() # Ensure all newly defined layers are properly initialized
+
+    def aggregate(self, x_encoded_instances):
+        return torch.max(x_encoded_instances, dim=1).values
+
+    def forward(self, x_instance_embeddings, task_to_cluster_id_map: dict):
+        x_shared_instance_features = self.base_network(x_instance_embeddings)
+        x_aggregated_bag_features = self.aggregate(x_shared_instance_features)
+
+        outputs = {}
+        for task_name in self.task_names:
+            cluster_id = task_to_cluster_id_map.get(task_name)
+
+            if cluster_id is None or not (0 <= cluster_id < self.num_clusters):
+                print(f"Error: Task {task_name} has invalid or missing cluster_id: {cluster_id}. Number of clusters: {self.num_clusters}. Skipping task.")
+                num_classes_for_task = self.output_dims_dict.get(task_name)
+                if num_classes_for_task is not None:
+                    batch_s = x_aggregated_bag_features.shape[0]
+                    outputs[task_name] = torch.zeros(batch_s, num_classes_for_task).to(x_instance_embeddings.device)
+                continue
+
+            trunk_output = self.cluster_trunks[cluster_id](x_aggregated_bag_features)
+            outputs[task_name] = self.task_heads[task_name](trunk_output)
+
+        return outputs
 
 
 class AttentionMLP(BaseMLP):
@@ -748,354 +900,366 @@ class PolicyNetwork(nn.Module):
         for i, r in enumerate(self.rewards):
             self.rewards[i] = float((r - R_mean) / (R_std + eps))
 
-    def select_from_dataloader(self, dataloader, device, bag_size, sample_algorithm, only_ensemble=False, epsilon=0.1):
+    def select_from_dataloader(self, dataloader, device, bag_size, sample_algorithm, only_ensemble_if_random=False, epsilon_for_random=0.1):
         data_pool_items = []
 
-        for batch_x_orig, batch_y_dict_orig, indices_orig, instance_labels_orig_batch in dataloader:
-            batch_x_orig = batch_x_orig.to(device)
-            action_probs, _, _ = self.forward(batch_x_orig)
+        # Iterate over the dataloader without gradient calculation
+        with torch.no_grad():
+            for batch_x_orig, batch_y_dict_orig, indices_orig, instance_labels_orig_batch in dataloader:
+                batch_x_orig = batch_x_orig.to(device)
 
-            action, _ = sample_action(
-                action_probs,
-                bag_size, # bag_size here is the number of items to select (k)
-                device=device,
-                random=(epsilon > np.random.random()) or only_ensemble,
-                algorithm=sample_algorithm
-            )
+                # Forward pass through the policy network to get action probabilities and other outputs
+                action_probs, _, _ = self.forward(batch_x_orig)
+                is_random_selection = (epsilon_for_random > np.random.random()) or only_ensemble_if_random
 
-            # Get the selected instances based on the actions
-            sel_x = select_from_action(action, batch_x_orig)
+                # Sample actions from the action probabilities using the specified algorithm and randomness
+                action, _ = sample_action(
+                    action_probs,
+                    bag_size,
+                    device=device,
+                    random=is_random_selection,
+                    algorithm=sample_algorithm
+                )
 
-            # Iterate through each bag in the original batch to create items for the pool
-            for i in range(len(batch_x_orig)):
-                sel_x_for_bag_item = sel_x[i].unsqueeze(0).cpu()
+                # Select the corresponding input features for the sampled actions
+                sel_x = select_from_action(action, batch_x_orig)
 
-                batch_y_dict_for_bag_item = {
-                    task: label_tensor[i].unsqueeze(0).cpu()
-                    for task, label_tensor in batch_y_dict_orig.items()
-                }
+                # Iterate over each item in the batch
+                for i in range(len(batch_x_orig)):
+                    sel_x_for_bag_item = sel_x[i].unsqueeze(0).cpu()
 
-                index_for_bag_item = indices_orig[i].cpu()
+                    # Create a dictionary of target labels for the current bag item
+                    batch_y_dict_for_bag_item = {
+                        task: label_tensor[i].unsqueeze(0).cpu()
+                        for task, label_tensor in batch_y_dict_orig.items()
+                    }
+                    index_for_bag_item = indices_orig[i].cpu()
 
-                current_instance_labels = [] # Default
-                if instance_labels_orig_batch is not None:
-                    if isinstance(instance_labels_orig_batch, torch.Tensor) and instance_labels_orig_batch.ndim > 0 : # If it's a batched tensor
-                         if i < len(instance_labels_orig_batch): # Check bounds
-                            current_instance_labels = instance_labels_orig_batch[i].cpu() # If tensor, get i-th element
-                    elif isinstance(instance_labels_orig_batch, list):
-                        if i < len(instance_labels_orig_batch): # Check bounds
-                            item_instance_label = instance_labels_orig_batch[i]
-                            if isinstance(item_instance_label, torch.Tensor):
-                                current_instance_labels = item_instance_label.cpu()
-                            else: # Assuming it's already a list or suitable structure
-                                current_instance_labels = item_instance_label
-                    # If instance_labels_orig_batch is just one item (e.g. an empty list passed for all), handle appropriately
-                    elif not isinstance(instance_labels_orig_batch, list) and not isinstance(instance_labels_orig_batch, torch.Tensor) and i==0:
-                         current_instance_labels = instance_labels_orig_batch # Should ideally be a list per bag
+                    # Get the instance labels for the current bag item if available
+                    current_instance_labels = []
+                    if instance_labels_orig_batch is not None and len(instance_labels_orig_batch) > 0:
+                        if i < len(instance_labels_orig_batch):
+                           item_inst_label = instance_labels_orig_batch[i]
+                           current_instance_labels = item_inst_label.cpu() if isinstance(item_inst_label, torch.Tensor) else item_inst_label
 
-
-                data_pool_items.append((
-                    sel_x_for_bag_item,
-                    batch_y_dict_for_bag_item,
-                    index_for_bag_item,
-                    current_instance_labels  # The (potentially processed) instance labels for this one bag
-                ))
+                    # Append the bag item data to the pool items list
+                    data_pool_items.append((
+                        sel_x_for_bag_item,
+                        batch_y_dict_for_bag_item,
+                        index_for_bag_item,
+                        current_instance_labels
+                    ))
         return data_pool_items
 
-    def compute_reward(self, eval_data):
+    def compute_reward(self, eval_data, task_to_cluster_id_map: dict):
         with torch.no_grad():
             task_data_ys_all = {task: [] for task in self.task_names}
             task_pred_ys_all = {task: [] for task in self.task_names}
-            # task_prob_ys_all = {task: [] for task in self.task_names} # If needed for other metrics like AUC
-
             all_batch_combined_loss_items = []
 
+            # Iterate over each batch in the evaluation data
             for batch_x, batch_y_dict, _, _ in eval_data:
                 batch_x = batch_x.to(self.device)
-                batch_y_dict_device = {k: v.to(self.device) for k, v in batch_y_dict.items()}
-
-                pred_out_dict, combined_loss_item, individual_batch_losses = self.eval_minibatch(batch_x, batch_y_dict_device)
+                pred_out_dict, combined_loss_item, _ = self.eval_minibatch(batch_x, batch_y_dict, task_to_cluster_id_map)
                 all_batch_combined_loss_items.append(combined_loss_item)
 
+                # Collect predictions and true labels for each task
                 for task_name in self.task_names:
-                    pred_out_task = pred_out_dict[task_name]
-                    batch_y_task_cpu = batch_y_dict[task_name]
+                    if task_name in pred_out_dict and task_name in batch_y_dict:
+                        pred_out_task = pred_out_dict[task_name]
+                        batch_y_task_cpu = batch_y_dict[task_name].cpu() # Ensure on CPU for numpy conversion
+                        pred_y_task = torch.argmax(pred_out_task, dim=1)
+                        task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
+                        task_data_ys_all[task_name].append(batch_y_task_cpu)
 
-                    pred_y_task = torch.argmax(pred_out_task, dim=1) # Assuming classification
-
-                    task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
-                    task_data_ys_all[task_name].append(batch_y_task_cpu)
-                    # task_losses[task_name].append(individual_batch_losses[task_name]) # Accumulate individual losses if needed
-
-            # Calculate F1 for each task and average for combined reward
             task_f1_scores = {}
             all_task_preds_final_for_reward = {}
             all_task_labels_final_for_reward = {}
 
+            # Compute F1 scores for each task and collect predictions/labels
             for task_name in self.task_names:
-                pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0)
-                data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0)
+                if task_pred_ys_all[task_name] and task_data_ys_all[task_name]:
+                    pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0)
+                    data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0)
+                    all_task_preds_final_for_reward[task_name] = pred_Y_task
+                    all_task_labels_final_for_reward[task_name] = data_Y_task
+                    task_f1_scores[task_name] = f1_score(data_Y_task.numpy().ravel(), pred_Y_task.numpy().ravel(), average='macro', zero_division=0)
+                else:
+                    task_f1_scores[task_name] = 0.0
 
-                all_task_preds_final_for_reward[task_name] = pred_Y_task
-                all_task_labels_final_for_reward[task_name] = data_Y_task
+            combined_scalar_reward = np.mean(list(task_f1_scores.values())) if task_f1_scores else 0.0
+            mean_overall_combined_loss = np.mean(all_batch_combined_loss_items) if all_batch_combined_loss_items else 0.0
 
-                task_f1_scores[task_name] = f1_score(data_Y_task.data.numpy(), pred_Y_task.data.numpy(), average='macro', zero_division=0)
-
-            combined_scalar_reward = np.mean(list(task_f1_scores.values()))
-            mean_overall_combined_loss = np.mean(all_batch_combined_loss_items)
-
-        # Return:
-        # 1. combined_scalar_reward (for RL agent)
-        # 2. mean_overall_combined_loss (for logging/evaluation)
-        # 3. all_task_preds_final_for_reward (dict: task -> tensor of predictions for this eval_data pass)
-        # 4. all_task_labels_final_for_reward (dict: task -> tensor of labels for this eval_data pass)
         return combined_scalar_reward, mean_overall_combined_loss, all_task_preds_final_for_reward, all_task_labels_final_for_reward
 
 
-    def compute_metrics_and_details(self, eval_data):
+    def compute_metrics_and_details(self, eval_data_list_of_tuples, task_to_cluster_id_map: dict):
+        self.task_model.eval()
         with torch.no_grad():
             task_data_ys_all = {task: [] for task in self.task_names}
             task_pred_ys_all = {task: [] for task in self.task_names}
             task_prob_ys_all = {task: [] for task in self.task_names}
-            batch_losses_all = [] # Stores the combined loss from each batch
+            batch_losses_all = []
 
-            for batch_x, batch_y_dict, _, _ in eval_data:
-                batch_x = batch_x.to(self.device)
-                batch_y_dict_device = {k: v.to(self.device) for k, v in batch_y_dict.items()}
+            # Iterate over each tuple in the evaluation data list
+            for sel_x_bag, y_dict_bag, _, _ in eval_data_list_of_tuples:
+                sel_x_bag_device = sel_x_bag.to(self.device)
 
-                pred_out_dict, combined_loss_item, _ = self.eval_minibatch(batch_x, batch_y_dict_device)
+                # Evaluate a mini-batch and collect predictions, losses, and probabilities
+                pred_out_dict, combined_loss_item, _ = self.eval_minibatch(sel_x_bag_device, y_dict_bag, task_to_cluster_id_map)
                 batch_losses_all.append(combined_loss_item)
 
                 for task_name in self.task_names:
-                    pred_out_task = pred_out_dict[task_name]
+                    if task_name in pred_out_dict and task_name in y_dict_bag:
+                        pred_out_task = pred_out_dict[task_name]
+                        prob_y_task = torch.softmax(pred_out_task, dim=1)
+                        pred_y_task = torch.argmax(pred_out_task, dim=1)
 
-                    prob_y_task = torch.softmax(pred_out_task, dim=1)
-                    pred_y_task = torch.argmax(pred_out_task, dim=1)
+                        # Collect predictions, probabilities, and true labels for each task
+                        task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
+                        task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
+                        task_data_ys_all[task_name].append(y_dict_bag[task_name].cpu())
 
-                    task_pred_ys_all[task_name].append(pred_y_task.detach().cpu())
-                    task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
-                    task_data_ys_all[task_name].append(batch_y_dict[task_name].cpu()) # Original CPU labels
-
-            metrics_summary = {'loss': np.mean(batch_losses_all)} # Average of combined losses
+            # Initialize metrics summary and final predictions/labels
+            metrics_summary = {'loss': np.mean(batch_losses_all) if batch_losses_all else 0.0}
             all_probs_final = {}
             all_labels_final = {}
             all_preds_final = {}
 
             for task_name in self.task_names:
-                data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0).numpy()
-                pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0).numpy()
-                prob_Y_task = torch.cat(task_prob_ys_all[task_name], dim=0).numpy()
+                if not task_data_ys_all[task_name]:
+                    # If there are no labels, set metrics to zero and empty lists
+                    metrics_summary[f'{task_name}/f1'], metrics_summary[f'{task_name}/f1_micro'], metrics_summary[f'{task_name}/auc'], metrics_summary[f'{task_name}/accuracy'] = 0.0, 0.0, 0.0, 0.0
+                    all_labels_final[task_name], all_preds_final[task_name], all_probs_final[task_name] = [], [], []
+                    continue
+
+                # Collect true labels and predictions for each task
+                data_Y_task = torch.cat(task_data_ys_all[task_name], dim=0).numpy().ravel()
+                pred_Y_task = torch.cat(task_pred_ys_all[task_name], dim=0).numpy().ravel()
+                prob_Y_task_cat = torch.cat(task_prob_ys_all[task_name], dim=0)
+                prob_Y_task_np = prob_Y_task_cat.numpy()
 
                 all_labels_final[task_name] = data_Y_task.tolist()
                 all_preds_final[task_name] = pred_Y_task.tolist()
-                all_probs_final[task_name] = prob_Y_task.tolist()
+                all_probs_final[task_name] = prob_Y_task_np.tolist()
 
+                # Compute metrics for each task
                 f1_macro = f1_score(data_Y_task, pred_Y_task, average='macro', zero_division=0)
                 f1_micro = f1_score(data_Y_task, pred_Y_task, average='micro', zero_division=0)
-                acc = np.mean(data_Y_task == pred_Y_task) # accuracy_score
+                acc = accuracy_score(data_Y_task, pred_Y_task)
 
-                # AUC
-                if prob_Y_task.shape[1] == 2: # Binary classification
-                    auc_score = roc_auc_score(data_Y_task, prob_Y_task[:, 1], average='macro')
-                else: # Multi-class
-                    auc_score = roc_auc_score(data_Y_task, prob_Y_task, average='macro', multi_class='ovr')
+                auc_score = 0.0
+                if len(np.unique(data_Y_task)) > 1:
+                    if prob_Y_task_np.ndim == 2 and prob_Y_task_np.shape[1] == 2:
+                        auc_score = roc_auc_score(data_Y_task, prob_Y_task_np[:, 1], average='macro')
+                    elif prob_Y_task_np.ndim == 2 and prob_Y_task_np.shape[1] > 2 :
+                        auc_score = roc_auc_score(data_Y_task, prob_Y_task_np, average='macro', multi_class='ovr')
 
+                # Store metrics in summary
                 metrics_summary[f'{task_name}/f1'] = f1_macro
                 metrics_summary[f'{task_name}/f1_micro'] = f1_micro
                 metrics_summary[f'{task_name}/auc'] = auc_score
                 metrics_summary[f'{task_name}/accuracy'] = acc
 
-        # Return: metrics_summary (dict of metrics),
-        # all_probs_final (dict task -> list of prob lists),
-        # all_labels_final (dict task -> list of labels),
-        # all_preds_final (dict task -> list of preds)
         return metrics_summary, all_probs_final, all_labels_final, all_preds_final
 
-    def train_minibatch(self, batch_x, batch_y):
+    def train_minibatch(self, batch_x, batch_y_dict, task_to_cluster_id_map: dict):
         self.task_model.train()
-        batch_out = self.task_model(batch_x)
-        total_loss = 0
-        individual_losses = {}
-        for task_name, preds_task in batch_out.items():
-            loss = self.loss_fns[task_name](preds_task.squeeze(), batch_out[task_name].squeeze())
-            total_loss += loss
-            individual_losses[task_name] = loss.item()
+        batch_out_dict = self.task_model(batch_x, task_to_cluster_id_map)  # Forward pass through the model
 
-        if self.task_optim: # Check if optimizer is defined
+        total_loss = torch.tensor(0.0).to(self.device)
+        computed_losses = 0
+
+        # Iterate over each task and its corresponding predictions
+        for task_name, preds_task in batch_out_dict.items():
+            if task_name in self.loss_fns and task_name in batch_y_dict:
+                task_labels = batch_y_dict[task_name].to(self.device)
+                loss = self.loss_fns[task_name](preds_task.squeeze(), task_labels.squeeze().long())
+                total_loss = total_loss + loss
+                computed_losses +=1
+            else:
+                print(f"Warning (train_minibatch): Skipping task {task_name} for loss calculation due to missing loss_fn or labels.")
+
+        # Perform optimization step if losses were computed and an optimizer is available
+        if computed_losses > 0 and self.task_optim:
             self.task_optim.zero_grad()
             total_loss.backward()
             self.task_optim.step()
-        return total_loss.item() # Return combined loss
+            return total_loss.item()
+        elif computed_losses == 0:
+            print("Warning (train_minibatch): No losses computed for any task in this batch.")
+            return 0.0
 
-    def eval_minibatch(self, batch_x, batch_y):
+        # Return the total loss as a float if it's not already a tensor, otherwise return its item
+        return total_loss.item() if isinstance(total_loss, torch.Tensor) else float(total_loss)
+
+    def eval_minibatch(self, batch_x, batch_y_dict, task_to_cluster_id_map: dict):
         self.task_model.eval()
-        batch_out = self.task_model(batch_x)
-        total_loss = 0
-        individual_losses = {}
-        for task_name, preds_task in batch_out.items():
-            loss = self.loss_fns[task_name](preds_task.squeeze(), batch_out[task_name].squeeze())
-            total_loss += loss
-            individual_losses[task_name] = loss.item()
+        batch_out_dict = self.task_model(batch_x, task_to_cluster_id_map)
 
-        return batch_out, total_loss.item(), individual_losses # Return dict of outs, combined loss
+        # Initialize total loss and individual losses dictionary
+        total_loss = torch.tensor(0.0).to(self.device)
+        individual_losses = {}
+        computed_losses = 0
+
+        # Iterate over each task's predictions in the output dictionary
+        for task_name, preds_task in batch_out_dict.items():
+            # Check if the task has a corresponding loss function and labels available
+            if task_name in self.loss_fns and task_name in batch_y_dict:
+                task_labels = batch_y_dict[task_name].to(self.device)
+
+                # Calculate the loss for this task
+                loss = self.loss_fns[task_name](preds_task.squeeze(), task_labels.squeeze().long())
+                total_loss = total_loss + loss
+                individual_losses[task_name] = loss.item()
+                computed_losses +=1
+            else:
+                print(f"Warning (eval_minibatch): Skipping task {task_name} for loss calculation due to missing loss_fn or labels.")
+
+        # Return the output dictionary, total loss as a float, and individual losses
+        return batch_out_dict, (total_loss.item() if computed_losses > 0 else 0.0), individual_losses
 
     def create_pool_data(self, dataloader, bag_size, pool_size, random=False):
-        list_of_batches = []
-        for _ in range(pool_size):
-            current_epsilon = getattr(self, 'epsilon', 0.1)
+        list_of_selected_bag_batches = []
 
-            data = self.select_from_dataloader(
+        for _ in range(pool_size):
+            items_from_one_selection_pass = self.select_from_dataloader(
                 dataloader=dataloader,
                 device=self.device,
                 bag_size=bag_size,
                 sample_algorithm=self.sample_algorithm,
-                only_ensemble=random,
-                epsilon=current_epsilon
+                only_ensemble_if_random=random,
+                epsilon_for_random=self.epsilon
             )
-            list_of_batches.append(data)
-        return list_of_batches
+            list_of_selected_bag_batches.append(items_from_one_selection_pass)
 
-    def expected_reward_loss(self, pool_data, average='macro', verbos=False): # [cite: 1]
-        # pool_data is a list of lists. Each inner list is the result of one select_from_dataloader call.
-        # Each item in the inner list is a tuple: (sel_x_for_bag_item, batch_y_dict_for_bag_item, index_for_bag_item, current_instance_labels)
+        # Return the list of selected bag batches
+        return list_of_selected_bag_batches
 
+    def expected_reward_loss(self, pool_data, task_to_cluster_id_map: dict, average='macro', verbos=False):
         reward_pool, loss_pool = [], []
-
-        task_ensembled_preds = {task_name: [] for task_name in self.task_names}
+        task_ensembled_preds_accum = {task_name: [] for task_name in self.task_names}
         task_labels_for_ensemble = {task_name: None for task_name in self.task_names}
+        first_data_load_for_labels = True
 
-        # Check if pool_data itself or its first element (a list of batches/items from one selection run) is empty
         if not pool_data or not pool_data[0]:
-            # logger is not defined in this scope, but ideally, you'd log this.
-            # For now, printing a warning. In your actual code, ensure 'logger' is accessible.
-            print("WARNING: expected_reward_loss - pool_data is empty or its first selection run is empty. Returning default 0.0 rewards/loss.")
             return 0.0, 0.0, 0.0
 
-        first_data_load_for_labels = True # To get labels for ensemble F1 calculation just once
-        for data_selection_run in pool_data: # Each item is a list of (sel_x, y_dict, idx, inst_labels) tuples from one policy rollout
-            if not data_selection_run:
-                # This means one of the policy rollouts/selections over the dataloader resulted in no data.
-                # This could happen if select_from_dataloader returned an empty list.
-                print("WARNING: expected_reward_loss - A data_selection_run in pool_data is empty. Appending default reward/loss for this run.")
-                reward_pool.append(0.0)
-                loss_pool.append(0.0) # Use 0.0 for loss to avoid NaN issues with np.mean if all are problematic
-                # For ensemble predictions, this run contributes nothing or needs careful handling.
-                # For simplicity, we'll let the existing logic for task_ensembled_preds handle potentially shorter lists.
+        # Iterate over each batch of selected data in the pool
+        for data_selection_run_batch_items in pool_data:
+            if not data_selection_run_batch_items:
+                reward_pool.append(0.0); loss_pool.append(0.0)
                 continue
 
-            # compute_reward expects a list of these tuples (effectively, a batch of selected bags)
-            reward, loss, preds_dict_for_run, labels_dict_for_run = self.compute_reward(data_selection_run)
-
+            # Compute reward and loss for the current selection run batch
+            reward, loss, preds_dict_for_run, labels_dict_for_run = self.compute_reward(data_selection_run_batch_items, task_to_cluster_id_map)
             reward_pool.append(reward if reward is not None and not np.isnan(reward) else 0.0)
             loss_pool.append(loss if loss is not None and not np.isnan(loss) else 0.0)
 
+            # Accumulate predictions for ensemble calculation
             for task_name in self.task_names:
                 if task_name in preds_dict_for_run and preds_dict_for_run[task_name] is not None:
-                    # Ensure preds_dict_for_run[task_name] is a tensor before appending
-                    # compute_reward should return tensors for predictions
                     if isinstance(preds_dict_for_run[task_name], torch.Tensor):
-                        task_ensembled_preds[task_name].append(preds_dict_for_run[task_name])
-                    else:
-                        # This case should ideally not happen if compute_reward is consistent
-                        print(f"WARNING: Preds for task {task_name} in one run was not a tensor.")
-
+                        task_ensembled_preds_accum[task_name].append(preds_dict_for_run[task_name])
+                # Load labels only once from the first batch
                 if first_data_load_for_labels and task_name in labels_dict_for_run and labels_dict_for_run[task_name] is not None:
                      if isinstance(labels_dict_for_run[task_name], torch.Tensor):
                         task_labels_for_ensemble[task_name] = labels_dict_for_run[task_name]
-                     else:
-                        print(f"WARNING: Labels for task {task_name} in first run was not a tensor.")
             first_data_load_for_labels = False
 
-        # Calculate mean reward and loss, handling empty or all-NaN cases
+        # Calculate mean reward and loss from the pool
         mean_reward = np.mean(reward_pool) if reward_pool and not all(np.isnan(r) or r is None for r in reward_pool) else 0.0
         mean_loss = np.mean(loss_pool) if loss_pool and not all(np.isnan(l) or l is None for l in loss_pool) else 0.0
 
+        # Calculate F1 scores for the ensemble predictions
         ensemble_f1_scores_per_task = {}
         for task_name in self.task_names:
             if task_labels_for_ensemble[task_name] is not None and len(task_labels_for_ensemble[task_name]) > 0 and \
-               task_name in task_ensembled_preds and task_ensembled_preds[task_name]:
+               task_name in task_ensembled_preds_accum and task_ensembled_preds_accum[task_name]:
 
-                # Filter out any potential non-tensor entries if they slipped through (defensive)
-                valid_preds_for_stack = [p for p in task_ensembled_preds[task_name] if isinstance(p, torch.Tensor) and p.ndim > 0]
-
+                valid_preds_for_stack = [p for p in task_ensembled_preds_accum[task_name] if isinstance(p, torch.Tensor) and p.ndim > 0 and len(p)>0]
                 if not valid_preds_for_stack:
-                    # print(f"WARNING: No valid tensor predictions for task {task_name} for ensemble F1 calculation.")
                     ensemble_f1_scores_per_task[task_name] = 0.0
                     continue
-
                 try:
-                    # Assuming predictions are class indices (1D tensors per selection run)
-                    # Shape of each p in valid_preds_for_stack should be (num_samples_in_batch_from_selection_run)
-                    # We need to ensure they are concatenable or stackable. If num_samples varies, mode might be tricky.
-                    # Assuming for now each selection run processes the same set of eval items.
-                    stacked_preds_for_task = torch.stack(valid_preds_for_stack, dim=0) # Shape: (pool_size, num_samples)
+                    stacked_preds_for_task = torch.stack(valid_preds_for_stack, dim=0)
                     ensembled_final_preds_task, _ = torch.mode(stacked_preds_for_task, dim=0)
-
-                    labels_task_np = task_labels_for_ensemble[task_name].data.cpu().numpy()
-                    ensembled_preds_np = ensembled_final_preds_task.data.cpu().numpy()
-
-                    if len(np.unique(labels_task_np)) < 2 and len(labels_task_np) > 0: # Only one class present in true labels
-                         # print(f"INFO: Only one class present in true labels for task {task_name}. F1 is 0 if predictions differ, or 1 if all match (problematic for macro F1). Defaulting to 0 for safety.")
-                         f1_val = 0.0
-                         if np.all(labels_task_np == ensembled_preds_np): # If all preds match the single true class
-                             # This edge case might need specific handling depending on desired F1 interpretation
-                             # For macro-F1 with single true class, scikit-learn might warn or give 0.
-                             # Let's assume if perfect match to single class, it's 1.0 (for that class), but macro needs care.
-                             # Scikit-learn f1_score with average='macro' and single class in y_true typically gives 0 unless y_pred also only has that class.
-                              pass # f1_val stays 0.0 or as per scikit-learn's behavior for single class.
-
-                    ensemble_f1_scores_per_task[task_name] = f1_score(labels_task_np,
-                                                                  ensembled_preds_np,
-                                                                  average=average, zero_division=0)
+                    labels_task_np = task_labels_for_ensemble[task_name].data.cpu().numpy().ravel()
+                    ensembled_preds_np = ensembled_final_preds_task.data.cpu().numpy().ravel()
+                    ensemble_f1_scores_per_task[task_name] = f1_score(labels_task_np, ensembled_preds_np, average=average, zero_division=0)
                 except Exception as e:
-                    print(f"ERROR: Calculating ensemble F1 for task {task_name}: {e}")
+                    print(f"ERROR: Calculating ensemble F1 for task {task_name} in expected_reward_loss: {e}")
                     ensemble_f1_scores_per_task[task_name] = 0.0
             else:
-                # print(f"INFO: Not enough data to calculate ensemble F1 for task {task_name}.")
                 ensemble_f1_scores_per_task[task_name] = 0.0
 
+        # Calculate the average ensemble reward
         ensemble_f1_values = list(ensemble_f1_scores_per_task.values())
         valid_f1_values_ens = [f1 for f1 in ensemble_f1_values if isinstance(f1, (int, float)) and not np.isnan(f1)]
         ensemble_reward = np.mean(valid_f1_values_ens) if valid_f1_values_ens else 0.0
 
-        # Ensure all returned values are floats and not None or NaN
+        # Ensure all final values are numeric and handle any NaNs
         final_mean_reward = mean_reward if isinstance(mean_reward, (int, float)) and not np.isnan(mean_reward) else 0.0
         final_mean_loss = mean_loss if isinstance(mean_loss, (int, float)) and not np.isnan(mean_loss) else 0.0
         final_ensemble_reward = ensemble_reward if isinstance(ensemble_reward, (int, float)) and not np.isnan(ensemble_reward) else 0.0
 
         return final_mean_reward, final_mean_loss, final_ensemble_reward
 
-    def predict(self, data_batches):
+    def predict(self, data_batches_list_of_tuples, task_to_cluster_id_map: dict):
         self.task_model.eval()
         task_prob_ys_all = {task: [] for task in self.task_names}
         with torch.no_grad():
-            for batch_x, _, _, _ in data_batches: # y is not used for prediction here
-                batch_x = batch_x.to(self.device)
-                pred_out_dict = self.task_model(batch_x)
+            # Iterate over each batch of data provided
+            for batch_x_bag, _, _, _ in data_batches_list_of_tuples:
+                batch_x_bag_device = batch_x_bag.to(self.device)
+                # Get predictions from the model for this batch
+                pred_out_dict = self.task_model(batch_x_bag_device, task_to_cluster_id_map)
+                # Store the probabilities for each task
                 for task_name in self.task_names:
-                    prob_y_task = torch.softmax(pred_out_dict[task_name], dim=1)
-                    task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
+                    if task_name in pred_out_dict:
+                        prob_y_task = torch.softmax(pred_out_dict[task_name], dim=1)
+                        task_prob_ys_all[task_name].append(prob_y_task.detach().cpu())
 
+        # Concatenate predictions across all batches for each task
         concatenated_probs = {}
         for task_name in self.task_names:
-            concatenated_probs[task_name] = torch.cat(task_prob_ys_all[task_name], dim=0)
+            if task_prob_ys_all[task_name]:
+                concatenated_probs[task_name] = torch.cat(task_prob_ys_all[task_name], dim=0)
+            else:
+                concatenated_probs[task_name] = torch.empty(0)
         return concatenated_probs
 
-    def predict_pool(self, pool_data):
+    def predict_pool(self, pool_data, task_to_cluster_id_map: dict):
         all_task_probs_from_pool = {task: [] for task in self.task_names}
 
-        for data_item in pool_data:
-            prob_dict_one_selection = self.predict(data_item) # Returns dict: task -> probs for this selection
+        # Iterate over each run of selection in the pool
+        for data_selection_run_items in pool_data:
+            if not data_selection_run_items: continue
+
+            # Get predictions for the current selection run batch
+            prob_dict_one_selection = self.predict(data_selection_run_items, task_to_cluster_id_map)
+
+            # Accumulate probabilities for each task
             for task_name in self.task_names:
-                all_task_probs_from_pool[task_name].append(prob_dict_one_selection[task_name])
+                 if task_name in prob_dict_one_selection and prob_dict_one_selection[task_name].numel() > 0 :
+                    all_task_probs_from_pool[task_name].append(prob_dict_one_selection[task_name])
 
         ensembled_final_preds = {}
+        # Ensemble predictions by averaging probabilities across runs for each task
         for task_name in self.task_names:
-            # Stack probs for this task: (pool_size, num_samples, num_classes)
-            stacked_probs_task = torch.stack(all_task_probs_from_pool[task_name], dim=0)
-            mean_probs_task = torch.mean(stacked_probs_task, dim=0) #Shape: (num_samples, num_classes)
-            ensembled_final_preds[task_name] = torch.argmax(mean_probs_task, dim=1)
-
+            if all_task_probs_from_pool[task_name]:
+                try:
+                    stacked_probs_task = torch.stack(all_task_probs_from_pool[task_name], dim=0)
+                    mean_probs_task = torch.mean(stacked_probs_task, dim=0)
+                    ensembled_final_preds[task_name] = torch.argmax(mean_probs_task, dim=1)
+                except RuntimeError as e:
+                    print(f"Error stacking/meaning probabilities for task {task_name} in predict_pool: {e}")
+                    if all_task_probs_from_pool[task_name]:
+                         ensembled_final_preds[task_name] = torch.argmax(all_task_probs_from_pool[task_name][0], dim=1)
+                    else:
+                         ensembled_final_preds[task_name] = torch.empty(0, dtype=torch.long)
+            else:
+                ensembled_final_preds[task_name] = torch.empty(0, dtype=torch.long)
         return ensembled_final_preds
 
     def ensemble_predict(self, pool_data):

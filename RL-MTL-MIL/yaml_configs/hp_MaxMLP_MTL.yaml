@@ -1,0 +1,53 @@
+method: bayes
+metric:
+  goal: maximize
+  # This metric should be the average F1 score across all tasks,
+  # which your run_mil.py script should log to W&B.
+  name: eval/avg_F1_macro
+
+program: run_mil.py # This configuration is for the MIL pre-tuning script
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args}
+  # Add fixed arguments for all sweep runs here if needed
+  # - --balance_dataset
+
+run_cap: 50 # Total number of trials to run
+
+parameters:
+
+  # --- Hyperparameters to sweep using distributions ---
+
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-05
+    max: 1.0e-03
+
+  hidden_dim: # Hidden dimension for each task-specific head
+    distribution: categorical
+    values: [64, 128, 256]
+
+  batch_size:
+    distribution: categorical
+    values: [32, 64, 128]
+
+  # --- Hyperparameters kept constant for this sweep ---
+  # You can easily move any of these to the section above to sweep them as well.
+
+  epochs:
+    distribution: constant
+    value: 200 # A reasonable upper limit when using early stopping
+
+  dropout_p:
+    distribution: constant
+    value: 0.5
+
+  scheduler_patience:
+    distribution: constant
+    value: 5
+
+  early_stopping_patience:
+    distribution: constant
+    value: 15 # A good patience value for pre-tuning sweeps

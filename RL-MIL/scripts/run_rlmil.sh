@@ -3,25 +3,25 @@
 cd ..
 source venv/bin/activate
 
-baseline_types=("MeanMLP" "MaxMLP" "AttentionMLP" "repset")
+baseline_types=("MeanMLP")
 
 # For facebook dataset: ("care" "purity" "loyalty" "authority" "fairness")
 # For political_data_with_age dataset: ("age" "gender" "party")
 # For jigsaw datasets: ("hate")
-target_labels=("hate")
+target_labels=("age" "gender" "party")
 
-gpus=(0 1 2 3 4 5 6 7)
+gpus=(0)
 
 # wandb config
 wandb_entity="YOUR_WANDB_ENTITY"
 wandb_project="YOUR_WANDB_PROJECT_NAME"
 
 # Dataset is either: `political_data_with_age,` `facebook,` `jigsaw_5,` or `jigsaw_10`
-dataset="jigsaw_10"
+dataset="political_data_with_age"
 
 # For `facebook` and `political_data_with_age` datasets: "text"
 # For `jigsaw` datasets: "comment_text"
-data_embedded_column_name="comment_text"
+data_embedded_column_name="text"
 
 # Possible values: "vanilla" or "ensemble". Keep in mind before running the script with rl_task_model="ensemble" you should run the `only_ensemble` setting first.
 rl_task_model="vanilla"
