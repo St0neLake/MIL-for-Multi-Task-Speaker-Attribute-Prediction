@@ -625,13 +625,19 @@ def get_balanced_weights(labels):
     label_set.sort()
     perfect_balance_weights = [len(labels)/labels.count(element) for element in label_set]
 
-    sample_weights = [perfect_balance_weights[t] for t in labels]
+
+    sample_weights = [perfect_balance_weights[t] for t in labels] # Assign sample weights based on the sorted labels and perfect balance weights
     return sample_weights
 
-def get_task_representations_from_activations(task_model, dataloader, task_names, device):
-    task_model.eval()
+def get_task_representations_from_activations(task_model, dataloader, task_names, device, task_to_cluster_id_map: dict):
+    # Check if the model is the clustered version, otherwise this logic won't work.
+    if not hasattr(task_model, 'cluster_trunks'):
+        print("Error: get_task_representations_from_activations called on a non-clustered model.")
+        # You might want to have a separate representation function for non-clustered models
+        # or handle this case gracefully. For now, we return an empty dict.
+        return {}
 
-    # Each list will store [num_bags_in_batch, hidden_dim_of_first_head_layer] tensors
+    task_model.eval()
     task_activation_accumulators = {task: [] for task in task_names}
 
     with torch.no_grad():
@@ -642,25 +648,38 @@ def get_task_representations_from_activations(task_model, dataloader, task_names
             shared_instance_embeddings = task_model.base_network(batch_x)
             x_aggregated_bag_features = task_model.aggregate(shared_instance_embeddings)
 
-            # 2. For each task, get activations from the first hidden layer of its head
+            # 2. For each task, route through its trunk, then get activations from the final head
             for task_name in task_names:
-                if task_name in task_model.task_heads:
-                    task_head_mlp = task_model.task_heads[task_name]
-                    hidden_activations = task_head_mlp[1](task_head_mlp[0](x_aggregated_bag_features))
-                    task_activation_accumulators[task_name].append(hidden_activations.cpu())
-                else:
-                    print(f"Warning: Task head for {task_name} not found in task_model.")
+                cluster_id = task_to_cluster_id_map.get(task_name)
 
-    # 3. Consolidate and average activations for each task
+                if cluster_id is None:
+                    print(f"Warning: Task {task_name} has no cluster assignment. Skipping for representation.")
+                    continue
+
+                # --- THIS IS THE KEY FIX ---
+                # First, pass the shared features through the task's assigned cluster trunk
+                trunk_output = task_model.cluster_trunks[cluster_id](x_aggregated_bag_features)
+
+                # Now, get the representation from the first hidden layer of the FINAL task head,
+                # using the trunk_output as its input.
+                final_task_head_mlp = task_model.task_heads[task_name]
+
+                # This assumes the first two layers of the final head are Linear and ReLU
+                hidden_activations = final_task_head_mlp[1](final_task_head_mlp[0](trunk_output))
+                # --- END OF FIX ---
+
+                task_activation_accumulators[task_name].append(hidden_activations.cpu())
+
     task_representation_vectors = {}
     for task_name in task_names:
         if task_activation_accumulators[task_name]:
             all_activations_for_task = torch.cat(task_activation_accumulators[task_name], dim=0)
             task_representation_vectors[task_name] = torch.mean(all_activations_for_task, dim=0)
         else:
+            # Fallback if no activations were collected
             hidden_dim = task_model.task_heads[task_names[0]][0].out_features
             task_representation_vectors[task_name] = torch.zeros(hidden_dim)
-            print(f"Warning: No activations found for task {task_name}, returning zero vector.")
+            print(f"Warning: No activations found for task {task_name} during representation generation.")
 
     return task_representation_vectors
 
@@ -697,12 +716,14 @@ def calculate_task_similarity_matrix(task_representation_vectors, task_names):
     return similarity_df
 
 def assign_tasks_to_clusters(task_representation_vectors, task_names, num_clusters=2, random_state=None):
+    # Check if there are enough tasks and representations
     if not task_representation_vectors or len(task_names) < num_clusters:
         print("Warning: Not enough tasks or representations to cluster, assigning all to cluster 0 or returning empty.")
         if not task_names:
             return {}
         return {task_name: 0 for task_name in task_names}
 
+    # Extract feature vectors from representation vectors
     feature_matrix = []
     for task_name in task_names:
         if task_name in task_representation_vectors:
@@ -710,19 +731,21 @@ def assign_tasks_to_clusters(task_representation_vectors, task_names, num_cluste
         else:
             print(f"Warning: Missing representation for task {task_name} in assign_tasks_to_clusters. Skipping.")
 
+    # If not enough feature vectors, return a default assignment
     if not feature_matrix or len(feature_matrix) < num_clusters:
         print("Warning: Not enough task feature vectors for clustering after filtering. Assigning available to cluster 0.")
         return {task_name: 0 for task_name in task_representation_vectors.keys() if task_name in task_names}
 
-
+    # Convert the list of feature vectors to a numpy array
     feature_matrix_np = np.array(feature_matrix)
 
+    # If there are not enough tasks with representations, assign each to its own cluster or all to cluster 0
     if feature_matrix_np.shape[0] < num_clusters:
         print(f"Warning: Number of tasks with representations ({feature_matrix_np.shape[0]}) is less than num_clusters ({num_clusters}). Assigning each to its own cluster if possible, or all to 0.")
         if feature_matrix_np.shape[0] == 0: return {}
         return {task_names[i]: i for i in range(feature_matrix_np.shape[0])}
 
-
+    # Fit a KMeans model to the feature matrix and assign cluster labels
     kmeans = KMeans(n_clusters=num_clusters, random_state=random_state, n_init='auto')
     try:
         cluster_labels = kmeans.fit_predict(feature_matrix_np)
@@ -733,7 +756,8 @@ def assign_tasks_to_clusters(task_representation_vectors, task_names, num_cluste
         else:
             return {task_name: 0 for task_name in task_names}
 
-
+    # Create a dictionary mapping each task name to its cluster ID
     task_to_cluster_id = {task_name: label for task_name, label in zip(task_names, cluster_labels)}
 
+    # Return the dictionary of task-to-cluster assignments
     return task_to_cluster_id

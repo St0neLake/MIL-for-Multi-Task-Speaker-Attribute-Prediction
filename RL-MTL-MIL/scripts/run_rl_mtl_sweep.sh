@@ -58,17 +58,17 @@ BASE_PREFIX_FOR_PY_SCRIPT="mtl_sweep_run"
 
 # --- WandB Configuration ---
 WANDB_ENTITY="stonelake-university-of-amsterdam"    # Your W&B entity
-WANDB_PROJECT="RL_MIL_MTL_small_2" # Dedicated project for RL-MTL sweeps
+WANDB_PROJECT="RL_MIL_MTL_big" # Dedicated project for RL-MTL sweeps
 
 # --- Execution Configuration ---
 GPU_ID=0 # GPU for the sweep agent
 # This seed is for data splitting consistency for the dataset being used by all sweep trials.
 # It should match the seed used for pre-tuning the MIL model.
-SWEEP_RUN_RANDOM_SEED=1
+SWEEP_RUN_RANDOM_SEED=64
 
 # --- Fixed Pool Sizes (if not part of the sweep YAML) ---
 TRAIN_POOL_SIZE=1
-EVAL_POOL_SIZE=10
+EVAL_POOL_SIZE=3
 TEST_POOL_SIZE=10
 
 echo "---------------------------------------------------------------------"

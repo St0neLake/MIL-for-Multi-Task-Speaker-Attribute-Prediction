@@ -108,7 +108,7 @@ class BaseMLP(nn.Module, ABC):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, task_to_cluster_id_map: dict = None) -> torch.Tensor:
         x = self.base_network(x)
         aggregated_x = self.aggregate(x)
 
@@ -159,41 +159,45 @@ class ClusteredMeanMLP(BaseMLP):
     def __init__(
             self,
             input_dim: int,
-            hidden_dim_base_network: list,
-            hidden_dim_cluster_trunk: int,
-            hidden_dim_final_head: int,
             output_dims_dict: dict[str, int],
             num_clusters: int,
-            dropout_p: float = 0.5,
+            hidden_dim_cluster_trunk: int,
+            hidden_dim_final_head: int,
+            autoencoder_layer_sizes: list = None, # <<<< THIS PARAMETER IS NOW CORRECTLY DEFINED
+            dropout_p: float = 0.5
     ):
-        # Initialize the base class with input dimensions and other parameters
+        # Initialize the parent BaseMLP, passing all required arguments to it.
+        # The BaseMLP.__init__ in your Snellius version expects all these arguments.
         super(ClusteredMeanMLP, self).__init__(
             input_dim=input_dim,
-            hidden_dim=hidden_dim_final_head,
+            hidden_dim=hidden_dim_final_head, # BaseMLP's hidden_dim is for the final heads
             output_dims_dict=output_dims_dict,
             dropout_p=dropout_p,
-            autoencoder_layer_sizes=hidden_dim_base_network
+            autoencoder_layer_sizes=autoencoder_layer_sizes # Pass this to the parent
         )
 
-        # Set the number of clusters and other parameters
         self.num_clusters = num_clusters
-        self.output_dims_dict = output_dims_dict
         self.task_names = list(output_dims_dict.keys())
-        dim_after_aggregation = self.input_dim_for_aggregation
 
-        # Initialize cluster trunks as a list of sequential layers
+        # self.base_network is created by BaseMLP's __init__
+        # self.input_dim_for_aggregation is also set by BaseMLP's __init__
+        dim_input_to_trunks = self.input_dim_for_aggregation
+
+        # Define Cluster-Specific Trunks
         self.cluster_trunks = nn.ModuleList()
         for _ in range(num_clusters):
             trunk = nn.Sequential(
-                nn.Linear(dim_after_aggregation, hidden_dim_cluster_trunk),
+                nn.Linear(dim_input_to_trunks, hidden_dim_cluster_trunk),
                 nn.ReLU(),
                 nn.Dropout(p=dropout_p)
             )
             self.cluster_trunks.append(trunk)
 
-        # Initialize task heads as a dictionary of sequential layers
+        # Redefine self.task_heads from BaseMLP to sit on top of the new cluster trunks.
+        # The original self.task_heads created by BaseMLP will be replaced by this new ModuleDict.
         self.task_heads = nn.ModuleDict()
         for task_name, num_classes_for_task in self.output_dims_dict.items():
+            # This final head takes the output from a cluster_trunk.
             self.task_heads[task_name] = nn.Sequential(
                 nn.Linear(hidden_dim_cluster_trunk, hidden_dim_final_head),
                 nn.ReLU(),
@@ -201,29 +205,27 @@ class ClusteredMeanMLP(BaseMLP):
                 nn.Linear(hidden_dim_final_head, num_classes_for_task)
             )
 
-        # Initialize weights for all layers
-        self.initialize_weights()
+        self.initialize_weights() # Ensure all newly defined layers are properly initialized
 
+    def aggregate(self, x_encoded_instances):
+        return torch.mean(x_encoded_instances, dim=1)
 
     def forward(self, x_instance_embeddings, task_to_cluster_id_map: dict):
-        # Pass instance embeddings through the base network to get shared features
         x_shared_instance_features = self.base_network(x_instance_embeddings)
-
-        # Aggregate shared features by computing mean along bag size dimension
         x_aggregated_bag_features = self.aggregate(x_shared_instance_features)
 
-        # Initialize output dictionary
         outputs = {}
-
-        # Iterate over task names and process each task separately
         for task_name in self.task_names:
             cluster_id = task_to_cluster_id_map.get(task_name)
 
-            if cluster_id is None or cluster_id >= self.num_clusters:
-                print(f"Warning/Error: Task {task_name} has invalid cluster_id {cluster_id}. Defaulting or erroring.")
-                if cluster_id is None: continue
+            if cluster_id is None or not (0 <= cluster_id < self.num_clusters):
+                print(f"Error: Task {task_name} has invalid or missing cluster_id: {cluster_id}. Number of clusters: {self.num_clusters}. Skipping task.")
+                num_classes_for_task = self.output_dims_dict.get(task_name)
+                if num_classes_for_task is not None:
+                    batch_s = x_aggregated_bag_features.shape[0]
+                    outputs[task_name] = torch.zeros(batch_s, num_classes_for_task).to(x_instance_embeddings.device)
+                continue
 
-            # Pass aggregated features through the corresponding cluster trunk and task head to get output for current task
             trunk_output = self.cluster_trunks[cluster_id](x_aggregated_bag_features)
             outputs[task_name] = self.task_heads[task_name](trunk_output)
 
@@ -252,6 +254,81 @@ class MaxMLP(BaseMLP):
         return torch.max(
             x, dim=1
         ).values  # Compute the max along the bag_size dimension
+
+
+class ClusteredMaxMLP(BaseMLP):
+    def __init__(
+            self,
+            input_dim: int,
+            output_dims_dict: dict[str, int],
+            num_clusters: int,
+            hidden_dim_cluster_trunk: int,
+            hidden_dim_final_head: int,
+            autoencoder_layer_sizes: list = None,
+            dropout_p: float = 0.5
+    ):
+        # Initialize the parent BaseMLP
+        super(ClusteredMaxMLP, self).__init__(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim_final_head, # BaseMLP's hidden_dim is for the final heads
+            output_dims_dict=output_dims_dict,
+            dropout_p=dropout_p,
+            autoencoder_layer_sizes=autoencoder_layer_sizes
+        )
+
+        self.num_clusters = num_clusters
+        self.task_names = list(output_dims_dict.keys())
+
+        # self.base_network is created by BaseMLP's __init__
+        # self.input_dim_for_aggregation is also set by BaseMLP's __init__
+        dim_input_to_trunks = self.input_dim_for_aggregation
+
+        # Define Cluster-Specific Trunks
+        self.cluster_trunks = nn.ModuleList()
+        for _ in range(num_clusters):
+            trunk = nn.Sequential(
+                nn.Linear(dim_input_to_trunks, hidden_dim_cluster_trunk),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p)
+            )
+            self.cluster_trunks.append(trunk)
+
+        # Redefine self.task_heads to sit on top of the new cluster trunks
+        self.task_heads = nn.ModuleDict()
+        for task_name, num_classes_for_task in self.output_dims_dict.items():
+            # This final head takes the output from a cluster_trunk
+            self.task_heads[task_name] = nn.Sequential(
+                nn.Linear(hidden_dim_cluster_trunk, hidden_dim_final_head),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_p),
+                nn.Linear(hidden_dim_final_head, num_classes_for_task)
+            )
+
+        self.initialize_weights() # Ensure all newly defined layers are properly initialized
+
+    def aggregate(self, x_encoded_instances):
+        return torch.max(x_encoded_instances, dim=1).values
+
+    def forward(self, x_instance_embeddings, task_to_cluster_id_map: dict):
+        x_shared_instance_features = self.base_network(x_instance_embeddings)
+        x_aggregated_bag_features = self.aggregate(x_shared_instance_features)
+
+        outputs = {}
+        for task_name in self.task_names:
+            cluster_id = task_to_cluster_id_map.get(task_name)
+
+            if cluster_id is None or not (0 <= cluster_id < self.num_clusters):
+                print(f"Error: Task {task_name} has invalid or missing cluster_id: {cluster_id}. Number of clusters: {self.num_clusters}. Skipping task.")
+                num_classes_for_task = self.output_dims_dict.get(task_name)
+                if num_classes_for_task is not None:
+                    batch_s = x_aggregated_bag_features.shape[0]
+                    outputs[task_name] = torch.zeros(batch_s, num_classes_for_task).to(x_instance_embeddings.device)
+                continue
+
+            trunk_output = self.cluster_trunks[cluster_id](x_aggregated_bag_features)
+            outputs[task_name] = self.task_heads[task_name](trunk_output)
+
+        return outputs
 
 
 class AttentionMLP(BaseMLP):

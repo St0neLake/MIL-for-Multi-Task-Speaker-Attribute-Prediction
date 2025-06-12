@@ -9,7 +9,7 @@ source venv/bin/activate
 # This script initiates a W&B sweep for the RL-MTL framework WITH TASK CLUSTERING.
 
 # --- Fixed Parameters for this Sweep ---
-MTL_BASELINE_TYPE="MeanMLP"
+MTL_BASELINE_TYPE="MaxMLP"
 MTL_TARGET_LABELS_STR="age gender party"
 
 DATASET="political_data_with_age"
@@ -42,7 +42,7 @@ BASE_PREFIX_FOR_PY_SCRIPT="mtl_clust_sweep"
 
 # --- WandB Configuration ---
 WANDB_ENTITY="stonelake-university-of-amsterdam"   # Your W&B entity
-WANDB_PROJECT="RL_MIL_MTL_Clustering"              # Dedicated project for clustering sweeps
+WANDB_PROJECT="RL_MIL_MTL_Clustering_small_MaxMLP"              # Dedicated project for clustering sweeps
 
 # --- Execution Configuration ---
 GPU_ID=0
@@ -50,7 +50,7 @@ SWEEP_RUN_RANDOM_SEED=1 # Seed for data splitting consistency
 
 # --- Fixed Pool Sizes (if not part of the sweep YAML) ---
 TRAIN_POOL_SIZE=1
-EVAL_POOL_SIZE=10
+EVAL_POOL_SIZE=3
 TEST_POOL_SIZE=10
 
 echo "---------------------------------------------------------------------"
