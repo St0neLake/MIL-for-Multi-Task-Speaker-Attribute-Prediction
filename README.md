@@ -57,7 +57,8 @@ The models are trained on the U.S. Congressional Record dataset. Follow these st
 Run the provided shell script to process the raw speeches and create the final dataset splits (`train`, `dev`, `test`).
 
 ```bash
-bash scripts/prepare_dataset.sh
+cd scripts
+./prepare_dataset.sh
 ```
 
 This script will run the full preprocessing pipeline and generate the final dataset file at `data/political_data.pkl`, which will be used for training.
