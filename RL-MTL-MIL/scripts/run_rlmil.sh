@@ -1,139 +1,154 @@
 #!/bin/bash
 
-cd .. # Navigate to the root of the RL-MIL directory (e.g., alirezaziabari/rl-mil/)
+cd ..
 source venv/bin/activate
 
-# ---- MTL Configuration ----
-mtl_baseline_type="MeanMLP" # Start with one baseline for testing
-mtl_target_labels_str="age gender party" # Your three target labels for MTL
+baseline_types=("MeanMLP")
 
-# GPU to use (ensure this GPU ID is available and works for you)
-# The gpus array from your script was (0 1 2 3). Let's pick the first one.
-mtl_gpu_id=0
+# For facebook dataset: ("care" "purity" "loyalty" "authority" "fairness")
+# For political_data_with_age dataset: ("age" "gender" "party")
+# For jigsaw datasets: ("hate")
+target_labels=("age" "gender" "party")
 
-# wandb config (Matches your provided script)
+gpus=(0 0 0 0)
+
+# wandb config
 wandb_entity="stonelake-university-of-amsterdam"
-wandb_project="RL_MIL_MTL_Test" # Suggestion: New project for MTL experiments
+wandb_project="RL_MIL_small"
 
-# Dataset and Embedding Details (Matches your provided script)
+# Dataset is either: `political_data_with_age,` `facebook,` `jigsaw_5,` or `jigsaw_10`
 dataset="political_data_with_age"
+
+# For `facebook` and `political_data_with_age` datasets: "text"
+# For `jigsaw` datasets: "comment_text"
 data_embedded_column_name="text"
-embedding_model="roberta-base"
 
-# RL-MIL Specific Settings (Matches your provided script)
+# Possible values: "vanilla" or "ensemble". Keep in mind before running the script with rl_task_model="ensemble" you should run the `only_ensemble` setting first.
 rl_task_model="vanilla"
+
+# These are sampling strategies for selecting $|b_i|$ instances with possible values: "static" "with_replacement" "without_replacement"
 sample_algorithm="without_replacement"
-autoencoder_layer_sizes="768,256,768"
-bag_size=20 # This is an array in your script, taking the first value
-rl_model="policy_only"
-search_algorithm="epsilon_greedy"
-reg_alg="sum" # This will add --reg_alg "sum" to the command
-prefix="mtl_test_age_gender_party" # Descriptive prefix for this MTL run
 
-# Hyperparameters for the run (Using defaults from your script or common values)
-# For a first test, you might want to use fewer epochs.
-epochs=50       # Reduced for a quicker test; adjust as needed (original script implies sweeps define this)
-batch_size=32   # From your script's python call
-actor_learning_rate=1e-4 # Placeholder - sweeps would determine optimal
-critic_learning_rate=1e-4 # Placeholder - sweeps would determine optimal
-learning_rate=1e-5       # Placeholder - sweeps would determine optimal (for MIL part)
-hdim=8                   # Placeholder - sweeps would determine optimal (for PolicyNetwork actor/critic)
-train_pool_size=1        # From your script
-eval_pool_size=10        # From your script
-test_pool_size=10        # From your script
-epsilon=0.1              # Placeholder for epsilon_greedy
-reg_coef=0.01            # Placeholder for reg_alg="sum"
-mil_task_head_hidden_dim=512
-
-# This random seed will be used for this specific MTL run (data splitting, initializations)
-# Your original script used random_seed 0 for sweeps, and 42 for a specific run. Let's use 42.
-random_seed_for_run=44
+# --no_autoencoder_for_rl flag can be used to run the experiments without autoencoder component
 
 # ---- Constants ----
-task_type="classification" # All three tasks are classification
+task_type="classification"
 
-echo "---------------------------------------------------------------------"
-echo "🚀 Starting MTL RL-MIL Run"
-echo "Labels: $mtl_target_labels_str"
-echo "Dataset: $dataset, Baseline: $mtl_baseline_type"
-echo "GPU ID for CUDA_VISIBLE_DEVICES: $mtl_gpu_id"
-echo "W&B Project: $wandb_project"
-echo "---------------------------------------------------------------------"
+# autoencoder_layer_sizes should be a string of comma-separated integers. We used "768,256,768" in all experiments.
+autoencoder_layer_sizes="768,256,768"
 
-# Construct the python command
-# The --label argument will now receive "age gender party"
-PYTHON_CMD="python3 run_rlmil.py \
-    --rl \
-    --baseline \"$mtl_baseline_type\" \
-    --label $mtl_target_labels_str \
-    --autoencoder_layer_sizes \"$autoencoder_layer_sizes\" \
-    --data_embedded_column_name \"$data_embedded_column_name\" \
-    --prefix \"$prefix\" \
-    --dataset \"$dataset\" \
-    --bag_size $bag_size \
-    --batch_size $batch_size \
-    --embedding_model \"$embedding_model\" \
-    --train_pool_size $train_pool_size \
-    --eval_pool_size $eval_pool_size \
-    --test_pool_size $test_pool_size \
-    --balance_dataset \
-    --wandb_entity \"$wandb_entity\" \
-    --wandb_project \"$wandb_project\" \
-    --random_seed $random_seed_for_run \
-    --task_type \"$task_type\" \
-    --rl_model \"$rl_model\" \
-    --search_algorithm \"$search_algorithm\" \
-    --rl_task_model \"$rl_task_model\" \
-    --sample_algorithm \"$sample_algorithm\" \
-    --epochs $epochs \
-    --actor_learning_rate $actor_learning_rate \
-    --critic_learning_rate $critic_learning_rate \
-    --learning_rate $learning_rate \
-    --hdim $hdim \
-    --hidden_dim $mil_task_head_hidden_dim \
-    --epsilon $epsilon \
-    --reg_coef $reg_coef \
-    --gpu $mtl_gpu_id" # Pass the GPU index for run_rlmil.py's internal use if needed
+# The size of b_i in the paper. We used 20 in all experiments.
+bag_sizes=(20)
 
-# Add --reg_alg if the variable is set (it is in this case)
-if [ ! -z "$reg_alg" ]; then
-    PYTHON_CMD="$PYTHON_CMD --reg_alg $reg_alg"
-fi
+embedding_models=("roberta-base")
 
-# To disable W&B for a purely local test, uncomment the next line
-# PYTHON_CMD="$PYTHON_CMD --no_wandb"
+prefix="loss"
 
-# To run without sweeps (which is typical for a direct test like this)
-# ensure --run_sweep is NOT in PYTHON_CMD unless you intend to trigger a sweep definition in run_rlmil.py
-# The original script adds --run_sweep. For this test, we are *not* running a hyperparameter sweep,
-# but a single run with fixed (chosen) hyperparameters.
-# So, remove --run_sweep if it was implicitly added.
-# The run_rlmil.py script structure seems to use --run_sweep to trigger wandb.agent().
-# If you remove --run_sweep, it should fall into the single run logic in main().
+rl_model="policy_only"
 
-# Let's ensure --run_sweep is NOT passed for this direct test,
-# unless your run_rlmil.py is structured to use it differently for single runs.
-# Assuming non-sweep execution for this test.
+search_algorithm="epsilon_greedy"
 
-# Run in a screen session
-SESSION_NAME="mtl_${prefix}_${mtl_baseline_type}"
-FULL_COMMAND="CUDA_VISIBLE_DEVICES=$mtl_gpu_id $PYTHON_CMD"
+reg_alg="sum"
 
-echo "Executing in screen session '$SESSION_NAME':"
-echo "$FULL_COMMAND"
-echo "---------------------------------------------------------------------"
+# Get the total number of runs
+total_runs=$((${#baseline_types[@]} * ${#target_labels[@]} * ${#bag_sizes[@]} * ${#embedding_models[@]}))
+current_run=1
 
-screen -dmS "$SESSION_NAME" bash -c "
-  $FULL_COMMAND; \
-  echo ''; \
-  echo '--------------------------------------------------'; \
-  echo 'MTL RL-MIL Run script finished in screen session.'; \
-  echo 'Screen session $SESSION_NAME will remain active.'; \
-  echo 'To detach: Ctrl+A then D'; \
-  echo '--------------------------------------------------'; \
-  exec bash" # Keeps the screen session alive
+# Loop over all combinations of baseline_type and target_label and embedding_model
+for target_label_index in "${!target_labels[@]}"; do
+  for bag_size_index in "${!bag_sizes[@]}"; do
+    for embedding_model_index in "${!embedding_models[@]}"; do
+      for baseline_type_index in "${!baseline_types[@]}"; do
+        # Get current target label
+        target_label=${target_labels[$target_label_index]}
+        # Get current bag_size
+        bag_size=${bag_sizes[$bag_size_index]}
+        # Get current embedding_model
+        embedding_model=${embedding_models[$embedding_model_index]}
+        # Get current baseline_type
+        baseline_type=${baseline_types[$baseline_type_index]}
+        # Get current gpu
+        gpu=${gpus[$target_label_index]}
+        echo "$baseline_type, $dataset $target_label, bag_size_$bag_size, $embedding_model, gpu_$gpu ($current_run/$total_runs)"
 
-echo "✅ MTL RL-MIL Run launched in screen session: $SESSION_NAME"
-echo "   To attach to the session, type: screen -r $SESSION_NAME"
-echo "   To view GPU usage, type in another terminal: watch -n 1 nvidia-smi"
-echo "---------------------------------------------------------------------"
+        # different RL models running
+        SESSION_NAME="${gpu}_${sample_algorithm}_${dataset}_${target_label}_${baseline_type}"
+        screen -dmS "$SESSION_NAME" bash -c "
+          CUDA_VISIBLE_DEVICES=$gpu python3 run_rlmil.py --rl --baseline $baseline_type \
+                                            --autoencoder_layer_sizes $autoencoder_layer_sizes \
+                                            --label $target_label \
+                                            --data_embedded_column_name $data_embedded_column_name \
+                                            --prefix $prefix \
+                                            --dataset $dataset \
+                                            --bag_size $bag_size \
+                                            --batch_size 32 \
+                                            --run_sweep \
+                                            --embedding_model $embedding_model \
+                                            --train_pool_size 1 --eval_pool_size 10 --test_pool_size 10 \
+                                            --balance_dataset \
+                                            --wandb_entity $wandb_entity \
+                                            --wandb_project $wandb_project \
+                                            --random_seed 1 \
+                                            --task_type $task_type \
+                                            --rl_model $rl_model \
+                                            --search_algorithm $search_algorithm \
+                                            --rl_task_model $rl_task_model \
+                                            --sample_algorithm $sample_algorithm \
+                                            --reg_alg $reg_alg ;
+          exit"
+
+        # different RL models without autoencoder
+        # SESSION_NAME="${gpu}_noauto_${sample_algorithm}_${dataset}_${target_label}_${baseline_type}"
+        # screen -dmS "$SESSION_NAME" bash -c "
+        #   CUDA_VISIBLE_DEVICES=$gpu python3 run_rlmil.py --rl --baseline $baseline_type \
+        #                                     --autoencoder_layer_sizes $autoencoder_layer_sizes \
+        #                                     --label $target_label \
+        #                                     --data_embedded_column_name $data_embedded_column_name \
+        #                                     --prefix $prefix \
+        #                                     --dataset $dataset \
+        #                                     --bag_size $bag_size \
+        #                                     --batch_size 32 \
+        #                                     --run_sweep \
+        #                                     --embedding_model $embedding_model \
+        #                                     --train_pool_size 1 --eval_pool_size 10 --test_pool_size 10 \
+        #                                     --balance_dataset \
+        #                                     --wandb_entity $wandb_entity \
+        #                                     --wandb_project $wandb_project \
+        #                                     --random_seed 0 \
+        #                                     --task_type $task_type \
+        #                                     --rl_model $rl_model \
+        #                                     --search_algorithm $search_algorithm \
+        #                                     --rl_task_model $rl_task_model \
+        #                                     --sample_algorithm $sample_algorithm \
+        #                                     --reg_alg $reg_alg  \
+        #                                     --no_autoencoder_for_rl ;
+        #   exit"
+
+        # only ensemble running
+        # SESSION_NAME="${gpu}_ens_${sample_algorithm}_${dataset}_${target_label}_${baseline_type}"
+        # screen -dmS "$SESSION_NAME" bash -c "
+        # CUDA_VISIBLE_DEVICES=$gpu python3 run_rlmil.py --rl --baseline $baseline_type \
+        #                                                                 --autoencoder_layer_sizes $autoencoder_layer_sizes \
+        #                                                                 --label $target_label \
+        #                                                                 --data_embedded_column_name $data_embedded_column_name \
+        #                                                                 --prefix $prefix \
+        #                                                                 --dataset $dataset \
+        #                                                                 --bag_size $bag_size \
+        #                                                                 --batch_size 32 \
+        #                                                                 --run_sweep \
+        #                                                                 --embedding_model $embedding_model \
+        #                                                                 --train_pool_size 1 --eval_pool_size 10 --test_pool_size 10 \
+        #                                                                 --balance_dataset \
+        #                                                                 --wandb_entity $wandb_entity \
+        #                                                                 --wandb_project $wandb_project \
+        #                                                                 --random_seed 0 \
+        #                                                                 --task_type $task_type \
+        #                                                                 --only_ensemble \
+        #                                                                 --rl_model $rl_model \
+        #                                                                 --sample_algorithm $sample_algorithm ;
+        #                                       exit"
+        ((current_run++))
+      done
+    done
+  done
+done
